@@ -53,6 +53,7 @@ _LOADING_PID_FILE = os.path.join(_DIR, ".voice_loading_pid")
 _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
+_TASKS_FILE = os.path.join(_DIR, ".voice_tasks")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -78,6 +79,22 @@ def set_state(name: str):
                 f.write(name)
         except OSError:
             pass
+
+
+def set_tasks(n: int):
+    """How many background tasks are running right now (the faces draw
+    one satellite per task). Temp-file-then-rename, unlike set_state's
+    direct write: this one's read on every poll tick by a server that
+    might catch it mid-write, and a half-written int fails to parse
+    where a half-written state name would just look like a typo.
+    Never raises."""
+    try:
+        tmp = f"{_TASKS_FILE}.tmp{os.getpid()}"
+        with open(tmp, "w") as f:
+            f.write(str(n))
+        os.replace(tmp, _TASKS_FILE)
+    except OSError:
+        pass
 
 
 def feed_waveform(pcm: np.ndarray):

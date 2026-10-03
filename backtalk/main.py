@@ -674,6 +674,7 @@ async def amain():
         say_after = None
         if verb == "clear":
             resp = await brain.command("/clear")
+            brain.clear_tasks()
             say_after = "Cleared. Fresh slate."
         elif verb == "compact":
             mouth.say("Compacting. One moment.")

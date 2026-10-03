@@ -47,7 +47,10 @@ import re
 import warnings
 from datetime import datetime
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk import (
+    ClaudeAgentOptions, ClaudeSDKClient, TERMINAL_TASK_STATUSES,
+    TaskNotificationMessage, TaskStartedMessage, TaskUpdatedMessage,
+)
 
 try:
     from claude_agent_sdk import CanUseToolShadowedWarning
@@ -114,6 +117,11 @@ class WarmBrain:
         self._capture: asyncio.Future | None = None
         self._capture_count_turn = True
         self._capture_buf: list[str] = []
+        # Background tasks currently running, keyed by task_id (a set,
+        # not a bare counter: duplicate or missed events must not drift
+        # the count). Published on every change so faces can draw one
+        # satellite per task.
+        self._active_tasks: set[str] = set()
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -149,6 +157,7 @@ class WarmBrain:
                 await self._client.connect()
                 log(f"[brain] resumed session {resume[:8]}")
                 self._start_reader()
+                self.clear_tasks()
                 return
             except Exception as e:
                 # a stale or invalid saved session must never brick the
@@ -162,6 +171,13 @@ class WarmBrain:
         self._client = ClaudeSDKClient(options=_opts(None))
         await self._client.connect()
         self._start_reader()
+        self.clear_tasks()
+
+    def clear_tasks(self):
+        """Reset the active-task set to empty (fresh launch, or the
+        session itself was cleared/reset underneath it)."""
+        self._active_tasks.clear()
+        signals.set_tasks(0)
 
     def _start_reader(self):
         self._reader_task = asyncio.ensure_future(self._read_forever())
@@ -418,6 +434,20 @@ class WarmBrain:
                     continue
                 nxt = asyncio.ensure_future(stream.__anext__())
                 t = type(msg).__name__
+
+                if isinstance(msg, TaskStartedMessage):
+                    self._active_tasks.add(msg.task_id)
+                    signals.set_tasks(len(self._active_tasks))
+                elif isinstance(msg, (TaskNotificationMessage,
+                                      TaskUpdatedMessage)):
+                    # A terminal status can arrive on EITHER message type,
+                    # and for TaskUpdatedMessage only in `patch` on some
+                    # SDK versions — check both spots, see the class docs.
+                    status = getattr(msg, "status", None) \
+                        or (getattr(msg, "patch", None) or {}).get("status")
+                    if status in TERMINAL_TASK_STATUSES:
+                        self._active_tasks.discard(msg.task_id)
+                        signals.set_tasks(len(self._active_tasks))
 
                 if self._capture is not None:
                     if t == "AssistantMessage":
