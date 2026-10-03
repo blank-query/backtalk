@@ -183,6 +183,19 @@ DEFAULTS = {
                    "acompressor=threshold=-18dB:ratio=2.5:attack=8:"
                    "release=120:makeup=4dB,alimiter=limit=0.95"),
     },
+    # Optional local engine: Piper (piper-tts), fast CPU-only synthesis
+    # built for weak ARM hardware — measured ~17x faster than Kokoro on
+    # a Raspberry Pi 5 (see the Remote Jarvis vault note). OFF by
+    # default; this desktop keeps using Kokoro. Checked before Kokoro
+    # but after ElevenLabs, with Kokoro as the automatic fallback on
+    # any Piper failure, same degrade-never-mute rule as ElevenLabs.
+    "piper": {
+        "enabled": False,
+        # Path to a downloaded .onnx voice model (+ matching .onnx.json
+        # alongside it). Get one with:
+        # python -m piper.download_voices <voice> --download-dir <dir>
+        "model_path": "",
+    },
     # Where the signal-bus files are written (.voice_state,
     # .voice_waveform, .voice_loading_pid) — anything can watch them;
     # visualizers pair with this contract. Default: the repo root.

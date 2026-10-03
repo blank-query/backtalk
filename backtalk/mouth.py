@@ -317,10 +317,48 @@ def _elevenlabs_ready() -> bool:
                 and _get_elevenlabs_key())
 
 
+_piper_voice = None
+_piper_lock = threading.Lock()
+
+
+def _piper_ready() -> bool:
+    pp = CFG["piper"]
+    return bool(pp.get("enabled") and pp.get("model_path"))
+
+
+def warm_piper():
+    """Load the Piper voice (first call loads the .onnx model).
+    Separate from Kokoro's warm() — only touched when piper.enabled."""
+    global _piper_voice
+    with _piper_lock:
+        if _piper_voice is None:
+            from piper import PiperVoice
+            path = CFG["piper"]["model_path"]
+            log(f"[mouth] loading piper ({path})...")
+            _piper_voice = PiperVoice.load(path)
+            log("[mouth] piper ready")
+    return _piper_voice
+
+
+def _stream_piper(text: str):
+    """One sentence -> (sample_rate, int16 PCM) chunks, in-process.
+    Piper's own voice config carries its sample rate (varies by voice,
+    unlike Kokoro's fixed KOKORO_RATE), so each chunk is yielded with
+    it rather than a module-level constant."""
+    voice = warm_piper()
+    rate = voice.config.sample_rate
+    for chunk in voice.synthesize(text):
+        a = chunk.audio_int16_array
+        if len(a):
+            yield rate, a
+
+
 def synth_stream(text: str, timeout: float = 30.0):
     """One sentence -> yields (sample_rate, pcm_chunk) as the TTS
-    renders. ElevenLabs when configured, Kokoro otherwise — and Kokoro
-    as the fallback on ANY ElevenLabs failure. Degrade, never mute."""
+    renders. ElevenLabs when configured, then Piper when configured
+    (the fast local engine for weak hardware like a Pi), then Kokoro —
+    which is also the automatic fallback on ANY earlier engine's
+    failure. Degrade, never mute."""
     if _elevenlabs_ready():
         try:
             for pcm in _stream_elevenlabs(text, timeout):
@@ -328,6 +366,13 @@ def synth_stream(text: str, timeout: float = 30.0):
             return
         except Exception as e:
             log(f"[mouth] elevenlabs failed ({str(e)[:60]}) — "
+                f"falling back to {'piper' if _piper_ready() else CFG['voice']}")
+    if _piper_ready():
+        try:
+            yield from _stream_piper(text)
+            return
+        except Exception as e:
+            log(f"[mouth] piper failed ({str(e)[:60]}) — "
                 f"falling back to {CFG['voice']}")
     for pcm in _stream_kokoro(text):
         yield KOKORO_RATE, pcm
