@@ -46,6 +46,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 
 import numpy as np
 import sounddevice as sd
@@ -519,7 +520,16 @@ class Mouth:
                         return False
                     block_pcm = pcm[i:i + block]
                     if out is not None:
-                        out.write(block_pcm)
+                        out.write(block_pcm)   # blocks in real time on its own
+                    else:
+                        # No local output to pace us: without this, the
+                        # whole sentence ships to the browser almost
+                        # instantly, the signal bus races to "idle"
+                        # long before the browser finishes actually
+                        # playing it, and anything watching /state
+                        # (e.g. the Interrupt button) disappears while
+                        # Jarvis is still audibly speaking.
+                        time.sleep(len(block_pcm) / rate)
                     # Re-check after the blocking write: a barge-in
                     # landing mid-block must not let feed_waveform
                     # re-assert "speaking" over a fresh "listening".

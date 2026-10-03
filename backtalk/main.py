@@ -836,12 +836,19 @@ async def amain():
             mouth.say(CFG["signoff"])
             mouth.wait_done(timeout=15)
             return False
-        if interrupt and brain.turn_active:
-            # The reader (brain.py) owns speaking now — interrupt() is
-            # a clean async call, nothing here to cancel-and-await.
-            log("[turn] interrupted mid-reply by new input")
-            _deny_pending()          # an ask never outlives its turn
-            await brain.interrupt()
+        if interrupt:
+            # mouth/remote_sink get stopped regardless of whether the
+            # SDK turn itself is still active: with real-time pacing,
+            # mouth can still be sending audio for many seconds after
+            # its ResultMessage already landed (see the Backtalk Turn
+            # Stream Redesign note's interrupt-gap fix), so gating this
+            # on brain.turn_active left that whole window unstoppable.
+            if brain.turn_active:
+                # The reader (brain.py) owns speaking now — interrupt()
+                # is a clean async call, nothing here to cancel-and-await.
+                log("[turn] interrupted mid-reply by new input")
+                _deny_pending()      # an ask never outlives its turn
+                await brain.interrupt()
             mouth.shut_up()
             if brain.remote_sink is not None:
                 brain.remote_sink.stop()
@@ -910,10 +917,14 @@ async def amain():
                 if brain.turn_active and not perm_wait:
                     log("[turn] interrupted mid-reply — new capture started")
                     await brain.interrupt()
-                    if brain.remote_sink is not None:
-                        brain.remote_sink.stop()
+                # Unconditional, same reasoning as handle(): mouth can
+                # still be sending audio long after turn_active goes
+                # False (real-time pacing), so stopping it can't be
+                # gated on the SDK turn still being live.
                 mouth.shut_up()
                 signals.static_stop()
+                if brain.remote_sink is not None:
+                    brain.remote_sink.stop()
             signals.set_state("listening")
             mouth.ducker.speech_start()
             _MIC["btn"] = True
