@@ -211,7 +211,7 @@ def _full_detail(tool, tool_input, ctx):
     return f"use {name}" + (f", {desc[:70]}" if desc else "")
 
 
-def make_permission_gate(mouth):
+def make_permission_gate(mouth, brain):
     from claude_agent_sdk import (PermissionResultAllow,
                                   PermissionResultDeny)
 
@@ -234,7 +234,7 @@ def make_permission_gate(mouth):
             _PERM["hinted"] = True
             ask += (" And any time you're done with these checks, say "
                     "stop asking for permission.")
-        mouth.say(ask)
+        mouth.say(ask, remote_sink=brain.remote_sink)
         answer = None
         try:
             deadline = loop.time() + PERM_TIMEOUT_S
@@ -250,7 +250,8 @@ def make_permission_gate(mouth):
                     except asyncio.TimeoutError:
                         if loop.time() >= deadline:
                             fut.cancel()
-                            mouth.say("No answer, so I didn't do it.")
+                            mouth.say("No answer, so I didn't do it.",
+                                     remote_sink=brain.remote_sink)
                             log("[perm]   timed out, denied")
                             return PermissionResultDeny(
                                 behavior="deny",
@@ -268,7 +269,7 @@ def make_permission_gate(mouth):
                     # not silence
                     log("[perm]   details requested")
                     mouth.say(f"The details: I want to {detail}. "
-                              "Yes or no?")
+                              "Yes or no?", remote_sink=brain.remote_sink)
                     deadline = loop.time() + PERM_TIMEOUT_S
                     continue
                 answer = got
@@ -600,9 +601,11 @@ async def amain():
 
     mouth = Mouth()
     ears = Ears()
-    brain = WarmBrain(model=model,
-                      can_use_tool=make_permission_gate(mouth),
-                      resume_id=resume_id, mouth=mouth)
+    # can_use_tool needs brain.remote_sink, but brain needs can_use_tool
+    # at construction — broken by constructing without it, then setting
+    # it once the gate has a real brain to close over.
+    brain = WarmBrain(model=model, resume_id=resume_id, mouth=mouth)
+    brain._can_use_tool = make_permission_gate(mouth, brain)
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"

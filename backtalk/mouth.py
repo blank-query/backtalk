@@ -396,10 +396,10 @@ class Mouth:
     def speaking(self) -> bool:
         return self._speaking.is_set()
 
-    def say(self, text: str):
+    def say(self, text: str, remote_sink=None):
         """Queue text (split to sentences) for speech."""
         for s in split_sentences(text):
-            self._q.put((s, None, None))
+            self._q.put((s, None, remote_sink))
 
     def say_chunk(self, text: str, directions=None, remote_sink=None):
         """Queue text as ONE TTS request, no sentence splitting — fuller
