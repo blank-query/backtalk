@@ -403,12 +403,6 @@ _PASTE_ON = "\x1b[200~"    # bracketed-paste markers (we enable the mode below)
 _PASTE_OFF = "\x1b[201~"
 
 
-# <<anything>> is a stage direction: lifted out, never spoken, published on
-# the bus when the audio carrying it starts. Bounded so a runaway model cannot
-# swallow a paragraph into one "tag".
-_DIRECTION_TAG = re.compile(r"<<([^<>]{1,80})>>")
-
-
 def _clean_typed(line: str) -> str:
     """Scrub terminal-copy artifacts: blockquote gutter glyphs and stray
     whitespace (copying from a CLI chat render drags bars along)."""
@@ -580,90 +574,6 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
-async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str,
-                      remote_sink=None):
-    """First sentence ships alone (fast start); the rest go in
-    2-sentence breaths — fuller chunks get livelier prosody (single
-    short sentences come out flat). A lone sentence followed by a
-    pause (the agent off running tools) is flushed after FLUSH_AFTER
-    rather than sitting silently until a partner sentence or the turn
-    ends — see the Backtalk Orphaned Sentence Bug note."""
-    t0 = time.time()
-    first = True
-    batch: list[str] = []
-    pending: list[str] = []          # directions waiting for their chunk
-    FLUSH_AFTER = 0.75   # seconds of silence before a lone sentence is spoken
-
-    def emit(raw: str):
-        nonlocal first, batch, pending
-        # STAGE DIRECTIONS: your agent may write <<anything>> inline. It is
-        # lifted out here, never spoken, and published on the signal bus when
-        # this chunk's audio starts (signals.direction). backtalk has no
-        # opinion on what a direction means; something watching the bus does.
-        #
-        # This used to strip only the ANGLE BRACKETS, which left the tag body
-        # in the sentence and the TTS read it aloud.
-        found = _DIRECTION_TAG.findall(raw)
-        if found:
-            pending += [d.strip() for d in found if d.strip()]
-        raw = _DIRECTION_TAG.sub(" ", raw)
-        # TTS hygiene: backticks and markdown fences are never speakable.
-        s = " ".join(raw.replace("`", "").split()).strip()
-        if not s:
-            return
-        if first:
-            log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
-                + (f"  <directions: {pending}>" if pending else ""))
-            mouth.say_chunk(s, pending, remote_sink)
-            pending = []
-            first = False
-        else:
-            log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
-            batch.append(s)
-            if len(batch) >= 2:
-                mouth.say_chunk(" ".join(batch), pending, remote_sink)
-                pending = []
-                batch = []
-
-    def flush():
-        nonlocal batch, pending
-        if batch:
-            mouth.say_chunk(" ".join(batch), pending, remote_sink)
-            pending = []
-            batch = []
-
-    try:
-        stream = brain.ask_stream(text).__aiter__()
-        nxt = asyncio.ensure_future(stream.__anext__())
-        try:
-            while True:
-                done, _ = await asyncio.wait({nxt}, timeout=FLUSH_AFTER)
-                if not done:
-                    flush()      # the agent paused (tool work): speak what's waiting
-                    await asyncio.wait({nxt})
-                try:
-                    sentence = nxt.result()
-                except StopAsyncIteration:
-                    break
-                emit(sentence)
-                nxt = asyncio.ensure_future(stream.__anext__())
-        finally:
-            if not nxt.done():
-                nxt.cancel()
-        flush()   # replaces the old post-loop `if batch:` block
-        if first:
-            # Zero sentences yielded (brain error / empty turn): nothing
-            # will ever dequeue, so nothing resets the bus — park it here.
-            signals.static_stop()
-            signals.set_state("idle")
-    except asyncio.CancelledError:
-        try:
-            await brain.interrupt()
-        except Exception:
-            pass
-        raise
-
-
 async def amain():
     open_mic = "--open-mic" in sys.argv
     barge_in = "--barge-in" in sys.argv
@@ -692,7 +602,7 @@ async def amain():
     ears = Ears()
     brain = WarmBrain(model=model,
                       can_use_tool=make_permission_gate(mouth),
-                      resume_id=resume_id)
+                      resume_id=resume_id, mouth=mouth)
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"
@@ -715,12 +625,8 @@ async def amain():
     log("[backtalk] connecting the brain...")
     try:
         await asyncio.wait_for(brain.start(), 120)
-
-        async def _warmup():
-            async for _ in brain.ask_stream(
-                    "Warmup ping - reply with the single word: ready"):
-                pass
-        await asyncio.wait_for(_warmup(), 180)
+        await asyncio.wait_for(brain.capture(
+            "Warmup ping - reply with the single word: ready"), 180)
     except (Exception, asyncio.TimeoutError) as e:
         kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
                 else f"failed: {e!r}"[:220])
@@ -744,7 +650,6 @@ async def amain():
     elif boot_effort:
         log(f"[backtalk] ignoring unknown effort {boot_effort!r} in config")
 
-    speak_task: asyncio.Task | None = None
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
     typed_fut: asyncio.Future | None = None
@@ -763,7 +668,6 @@ async def amain():
 
     async def _run_console_inner(verb):
         _deny_pending()
-        await brain.reset_turn()
         say_after = None
         if verb == "clear":
             resp = await brain.command("/clear")
@@ -882,12 +786,10 @@ async def amain():
                 mouth.say(say_after)
         signals.set_state("idle")
 
-    async def handle(text: str, spoke_from: float | None = None,
-                     remote_sink=None) -> bool:
+    async def handle(text: str, spoke_from: float | None = None) -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
         told apart from speech that began before the ask even existed."""
-        nonlocal speak_task
         log(f"[you]    {text}")
         # A pending spoken permission ask owns the next utterance IF
         # that utterance started after the ask was posed. Speech that
@@ -924,44 +826,26 @@ async def amain():
                 mouth.say("Staying as we are.")
                 return True
         if any(q in text.lower() for q in QUIT_PHRASES):
-            if speak_task and not speak_task.done():
-                speak_task.cancel()
+            await brain.interrupt()
             mouth.shut_up()
             mouth.say(CFG["signoff"])
             mouth.wait_done(timeout=15)
             return False
-        if speak_task and not speak_task.done():
+        if brain.turn_active:
+            # The reader (brain.py) owns speaking now — interrupt() is
+            # a clean async call, nothing here to cancel-and-await.
             log("[turn] interrupted mid-reply by new input")
             _deny_pending()          # an ask never outlives its turn
-            speak_task.cancel()
+            await brain.interrupt()
             mouth.shut_up()
-        if speak_task:
-            # Let the cancellation fully land (its brain.interrupt()
-            # included) BEFORE anything else touches the brain —
-            # otherwise the dead turn's stop signal can race in after
-            # the new query and kill the new answer (half of the
-            # off-by-one bug; see brain.reset_turn for the other half).
-            try:
-                await speak_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-            speak_task = None
         verb = verb or console_match(text)
         if verb:
             await run_console(verb)
             return True
         signals.set_state("thinking")
         signals.static_start()
-        # Clean the pipe: drain the interrupted turn's leftovers so the
-        # new question can't pair with a stale ResultMessage. A gate
-        # that fired in the meantime resolves first, or the drain would
-        # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
-        await brain.reset_turn()
-        speak_task = asyncio.create_task(
-            speak_reply(brain, mouth, text, remote_sink=remote_sink))
+        brain.ask(text)
         return True
 
     try:
@@ -975,9 +859,29 @@ async def amain():
         # THE BROWSER BRIDGE: a click/tap on the face in ai-visualizer is
         # another press, feeding this SAME loop and the SAME handle()
         # path as the key — see web.py's docstring for why.
+        #
+        # brain.remote_sink follows the CONNECTION, not the turn that
+        # was asked — once a browser tab is connected, every turn's
+        # audio goes to it too, whoever's turn it is (see the Backtalk
+        # Turn Stream Redesign note: with turns no longer paired to the
+        # query that may have started them, trying to route each one
+        # back to its original asker is exactly the kind of per-turn
+        # bookkeeping that caused the bug this redesign fixes).
         bridge: BrowserBridge | None = None
+        _ws_conn = {"current": None}
+
+        def _ws_connected(conn):
+            _ws_conn["current"] = conn
+            brain.remote_sink = bridge.make_sink(conn)
+
+        def _ws_disconnected(conn):
+            if _ws_conn["current"] is conn:
+                _ws_conn["current"] = None
+                brain.remote_sink = None
+
         if CFG.get("web", {}).get("enabled"):
-            bridge = BrowserBridge(CFG["web"])
+            bridge = BrowserBridge(CFG["web"], on_connect=_ws_connected,
+                                   on_disconnect=_ws_disconnected)
             asyncio.create_task(bridge.serve())
         ptt = PTTListener(CFG["ptt_key"])
         press_fut: asyncio.Future | None = None
@@ -990,12 +894,11 @@ async def amain():
             any live reply (unless a permission ask is pending — that
             TURN stays alive; the press only silences playback), duck,
             and mark the mic busy so the open mic (if any) yields."""
-            nonlocal speak_task
             perm_wait = (_PERM["fut"] is not None
                          and not _PERM["fut"].done())
-            if speak_task and not speak_task.done() and not perm_wait:
+            if brain.turn_active and not perm_wait:
                 log("[turn] interrupted mid-reply — new capture started")
-                speak_task.cancel()
+                await brain.interrupt()
             mouth.shut_up()
             signals.static_stop()
             signals.set_state("listening")
@@ -1123,15 +1026,12 @@ async def amain():
                     log("[web] (tap or empty — ignored)")
                     signals.set_state("idle")
                     continue
-                if not await handle(text, spoke_from=press_t,
-                                    remote_sink=bridge.make_sink(conn)):
+                if not await handle(text, spoke_from=press_t):
                     return
     except KeyboardInterrupt:
         pass
     finally:
         _MIC["gen"] += 1     # abort any live open-mic capture promptly
-        if speak_task and not speak_task.done():
-            speak_task.cancel()
         mouth.shutdown()  # restores the music on Ctrl-C / crash paths too
         signals.static_stop()
         if bridge is not None:

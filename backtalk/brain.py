@@ -23,6 +23,19 @@ process spawn, no per-turn context reload. Partial-message streaming
 means sentences are yielded the moment they're complete, so the mouth
 starts speaking while the rest of the thought is still forming.
 
+THE TURN STREAM: a Claude Code session is not request/response. Some
+turns start without anyone here asking — a background task finishing,
+a subagent reporting — and each has its own ResultMessage on the SAME
+shared stream. The old design (`ask_stream`, per-query
+`receive_response()`) assumed the next ResultMessage after a query was
+that query's own answer; it wasn't, for any turn that wasn't started
+by a direct ask. One background report and the whole session's answers
+ran one turn behind, permanently (see the Backtalk Turn Stream
+Redesign note). So instead: ONE reader task owns `receive_messages()`
+for the session's lifetime and speaks every turn as it arrives,
+whoever started it. Sending is just sending — `ask()` calls `query()`
+and returns; it never assumes the next reply is its own.
+
 The session's cwd is YOUR agent's folder (agent_dir in backtalk.json) —
 whatever CLAUDE.md lives there defines who is speaking. backtalk adds
 only the spoken-delivery discipline (config.DISCIPLINE): the medium,
@@ -46,6 +59,12 @@ from backtalk.config import CFG, DISCIPLINE
 from backtalk.vlog import log
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
+# <<anything>> is a stage direction: lifted out, never spoken, published on
+# the bus when the audio carrying it starts. Bounded so a runaway model
+# cannot swallow a paragraph into one "tag".
+_DIRECTION_TAG = re.compile(r"<<([^<>]{1,80})>>")
+FLUSH_AFTER = 0.75   # seconds of silence before a lone sentence is spoken,
+                     # see the Backtalk Orphaned Sentence Bug note
 
 
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
@@ -53,7 +72,7 @@ SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
 
 class WarmBrain:
     def __init__(self, model: str | None = None, can_use_tool=None,
-                 resume_id: str | None = None):
+                 resume_id: str | None = None, mouth=None):
         # Full model id ON PURPOSE — never a bare alias. The SDK
         # resolves aliases through its own bundled CLI and can silently
         # land on an older model.
@@ -62,19 +81,39 @@ class WarmBrain:
         # connect in EVERY mode, so a live mode flip needs no reconnect;
         # bypass simply never consults it.
         self._can_use_tool = can_use_tool
+        # The mouth the reader speaks every turn through. Set once at
+        # construction; main.py owns the Mouth instance's lifetime.
+        self.mouth = mouth
+        # While a browser client is connected, every turn — not just
+        # ones that client asked for — is ALSO sent its way (the
+        # simplest correct answer to "whose turn is this" once turns
+        # aren't paired to queries at all: Jarvis's future is all
+        # remote, so once a browser is listening, it hears everything).
+        # main.py/web.py set this on connect, clear it on disconnect.
+        self.remote_sink = None
         # Session usage, spoken on request ("usage report").
         self.session = {"turns": 0, "out_tokens": 0, "in_tokens": 0,
                         "cost": 0.0}
         self._client: ClaudeSDKClient | None = None
         # The session to reattach to at the FIRST start only (config key
-        # resume_last_session). Consumed on use: a desync rebuild in
-        # reset_turn() must always start FRESH: a rebuild means a turn
-        # went sideways mid-stream, the wrong moment to gamble on
-        # reattaching. (Community proposal, issue #1.)
+        # resume_last_session). Consumed on use.
         self._resume_id = resume_id
-        # True while a query's response hasn't been consumed through its
-        # ResultMessage — i.e. the shared message pipe may hold leftovers.
-        self._dirty = False
+        self._reader_task: asyncio.Task | None = None
+        # Set by interrupt() when a turn is actually in flight; tells
+        # the reader to discard that turn's trailing content (already
+        # cut off locally by mouth.shut_up()) through its ResultMessage,
+        # rather than speaking a dead turn's leftovers after the fact.
+        self._discard_until_result = False
+        # True from the first content of a turn until its ResultMessage.
+        # interrupt() is a no-op when this is False: nothing in flight,
+        # nothing to discard.
+        self._turn_active = False
+        # When set, the current turn's text is being collected for the
+        # caller (console commands, the warmup ping) instead of being
+        # spoken — see capture().
+        self._capture: asyncio.Future | None = None
+        self._capture_count_turn = True
+        self._capture_buf: list[str] = []
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -109,6 +148,7 @@ class WarmBrain:
                 self._client = ClaudeSDKClient(options=_opts(resume))
                 await self._client.connect()
                 log(f"[brain] resumed session {resume[:8]}")
+                self._start_reader()
                 return
             except Exception as e:
                 # a stale or invalid saved session must never brick the
@@ -121,6 +161,18 @@ class WarmBrain:
                     pass
         self._client = ClaudeSDKClient(options=_opts(None))
         await self._client.connect()
+        self._start_reader()
+
+    def _start_reader(self):
+        self._reader_task = asyncio.ensure_future(self._read_forever())
+
+    @property
+    def turn_active(self) -> bool:
+        """Whether a turn is currently in flight (content seen since
+        the last ResultMessage). main.py uses this to decide whether
+        there's anything for interrupt() to actually interrupt, and
+        whether to log it as one."""
+        return self._turn_active
 
     async def set_permission_mode(self, backtalk_mode: str):
         """Live flip, no reconnect, conversation intact ("ask" maps to
@@ -216,153 +268,259 @@ class WarmBrain:
         except Exception:
             pass
 
+    def ask(self, utterance: str):
+        """Send an utterance. SENDING IS JUST SENDING: this does not
+        wait for or return the reply — the reader speaks it, whoever's
+        turn it turns out to be. Equivalent for the caller's purposes
+        to firing a query and walking away.
+
+        turn_active flips True HERE, synchronously, not when the
+        reader first sees content — a press landing in the gap between
+        sending and the model's first token must still find a turn to
+        interrupt, or it slips through uninterrupted."""
+        self._turn_active = True
+        return asyncio.ensure_future(self._client.query(utterance))
+
+    async def capture(self, text: str, count_turn: bool = True) -> str:
+        """Send `text` and wait for the FULL text reply, un-spoken —
+        for console slash commands and the startup warmup ping, the two
+        callers that want an answer back as a return value rather than
+        audio. Bounded: this stream is not trusted to always deliver,
+        and an unbounded await here would deafen the whole voice loop.
+        Only one capture may be in flight at a time (both callers are
+        already serialized by the caller)."""
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._capture = fut
+        self._capture_count_turn = count_turn
+        self._capture_buf = []
+        await self._client.query(text)
+        try:
+            return await asyncio.wait_for(fut, 90)
+        except asyncio.TimeoutError:
+            log(f"[brain] capture timed out: {text!r}")
+            return "error: the command timed out"
+        finally:
+            if self._capture is fut:
+                self._capture = None
+
     async def command(self, cmd: str) -> str:
         """Run a console slash command (/clear, /compact, /model,
-        /effort) through the normal stream and return whatever text the
-        CLI answered with (confirmations, errors). Slash-command replies
-        arrive as COMPLETE AssistantMessages, not stream deltas, so
-        ask_stream cannot see them. Bounded like reset_turn is: this
-        stream is not trusted to always deliver, and an unbounded await
-        here would deafen the whole voice loop. On timeout the pipe is
-        left marked dirty so the next reset_turn drains or rebuilds."""
-        self._dirty = True
-        await self._client.query(cmd)
-        texts = []
-
-        async def _collect():
-            async for msg in self._client.receive_response():
-                t = type(msg).__name__
-                if t == "AssistantMessage":
-                    for b in getattr(msg, "content", []) or []:
-                        txt = getattr(b, "text", None)
-                        if txt:
-                            texts.append(txt)
-                elif t == "ResultMessage":
-                    self._dirty = False
-                    self._tally(msg, count_turn=False)
-                    self._remember_session(msg)
-                    break
-
-        try:
-            await asyncio.wait_for(_collect(), 90)
-        except asyncio.TimeoutError:
-            log(f"[brain] console command timed out: {cmd!r}")
-            return "error: the command timed out"
-        return " ".join(texts).strip()
+        /effort) and return whatever text the CLI answered with
+        (confirmations, errors)."""
+        return await self.capture(cmd, count_turn=False)
 
     async def interrupt(self):
-        if self._client:
-            await self._client.interrupt()
-
-    async def reset_turn(self, timeout: float = 8.0):
-        """Re-align the message pipe after an interrupted/failed turn.
-
-        THE OFF-BY-ONE BUG, and why this method exists: the SDK client
-        has ONE shared message stream and receive_response() stops at
-        the FIRST ResultMessage it sees — there is no pairing between a
-        query and its response. A cancelled turn stops consuming
-        mid-stream, leaving the dead turn's remaining messages
-        (including its ResultMessage) buffered. The next query then
-        pairs with those leftovers: the first ask lands on the stale
-        ResultMessage and yields nothing, and every ask after that
-        answers the PREVIOUS question — for the rest of the session.
-        So: interrupt the dead turn, then drain the pipe through its
-        stale ResultMessage before the next query goes out. No-op when
-        the last turn was consumed clean."""
-        if not self._client or not self._dirty:
+        """Stop whatever turn is live. A no-op when nothing is in
+        flight — there would be nothing for the reader to discard, and
+        discarding with nothing to discard-UNTIL would eat the next
+        turn's real content instead."""
+        if not self._client or not self._turn_active:
             return
+        self._discard_until_result = True
         try:
             await asyncio.wait_for(self._client.interrupt(), 5)
         except Exception:
-            pass  # turn may already be over — the drain below is the point
-
-        async def _drain() -> int:
-            n = 0
-            async for msg in self._client.receive_response():
-                n += 1
-                if type(msg).__name__ == "ResultMessage":
-                    break
-            return n
-
-        try:
-            drained = await asyncio.wait_for(_drain(), timeout)
-            log(f"[brain] interrupted turn drained ({drained} stale messages)")
-            self._dirty = False
-        except Exception:
-            # Can't re-align — rebuild the session rather than run
-            # desynced. Loses this voice session's conversation memory;
-            # better than answering every question one turn late for the
-            # rest of the day.
-            log("[brain] stream desynced beyond repair — rebuilding the "
-                "session (conversation memory for this session resets)")
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
-            self._client = None
-            await self.start()
-            self._dirty = False
+            pass  # the turn may already be over; the discard flag is the point
 
     async def stop(self):
+        if self._reader_task:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._reader_task = None
         if self._client:
             await self._client.disconnect()
             self._client = None
 
-    async def ask_stream(self, utterance: str):
-        """Yield complete sentences as they stream out of the model."""
-        self._dirty = True             # in flight until its ResultMessage
-        await self._client.query(utterance)
+    async def _read_forever(self):
+        """THE reader: the ONLY consumer of the session's message
+        stream, for its whole lifetime. Never stops, never pairs a
+        turn to the query that may or may not have started it — it
+        just speaks content as it arrives and resets at every
+        ResultMessage. A turn that was discarded (interrupt()) or
+        captured (capture()) takes the same boundary, just routed
+        differently instead of spoken.
+
+        Per-turn speaking state (first/batch/pending) lives in this
+        loop's locals, not on self: there is exactly one turn's worth
+        of it alive at a time, same invariant the old speak_reply()
+        held, just no longer scoped to a single query's generator."""
+        first = True
+        batch: list[str] = []
+        pending: list[str] = []
         buf = ""
-        async for msg in self._client.receive_response():
-            t = type(msg).__name__
-            if t == "StreamEvent":
-                ev = getattr(msg, "event", {}) or {}
-                if ev.get("type") == "content_block_delta":
-                    delta = ev.get("delta", {}) or {}
-                    if delta.get("type") == "text_delta":
-                        buf += delta.get("text", "")
-                        # emit any complete sentences
-                        while True:
-                            m = _SENTENCE_END.search(buf)
-                            if not m:
-                                break
-                            sentence, buf = (buf[:m.end()].strip(),
-                                             buf[m.end():])
-                            if sentence:
-                                yield sentence
-                elif ev.get("type") == "content_block_stop":
-                    # End of a speech block (e.g. right before a tool
-                    # call): flush NOW. Without this, pre-tool filler
-                    # ("On it — let me grab that.") sits silent in the
-                    # buffer through the whole tool run, then plays
-                    # glued to the answer: long dead air, then two
-                    # thoughts at once.
-                    tail = buf.strip()
-                    buf = ""
-                    if tail:
-                        yield tail
-            elif t == "ResultMessage":
-                self._dirty = False    # turn fully consumed — pipe aligned
-                self._tally(msg)
-                self._remember_session(msg)
-                await self._pull_rate_limits()
-                break
-        tail = buf.strip()
-        if tail:
-            yield tail
+
+        def flush():
+            nonlocal batch, pending
+            if batch and self.mouth:
+                self.mouth.say_chunk(" ".join(batch), pending,
+                                     self.remote_sink)
+                pending = []
+                batch = []
+
+        def emit(raw: str):
+            nonlocal first, batch, pending
+            found = _DIRECTION_TAG.findall(raw)
+            if found:
+                pending += [d.strip() for d in found if d.strip()]
+            raw = _DIRECTION_TAG.sub(" ", raw)
+            s = " ".join(raw.replace("`", "").split()).strip()
+            if not s or not self.mouth:
+                return
+            if first:
+                log(f"[Jarvis] {s}"
+                    + (f"  <directions: {pending}>" if pending else ""))
+                self.mouth.say_chunk(s, pending, self.remote_sink)
+                pending = []
+                first = False
+            else:
+                log(f"[Jarvis] {s}"
+                    + (f"  <directions: {pending}>" if pending else ""))
+                batch.append(s)
+                if len(batch) >= 2:
+                    flush()
+
+        def end_turn():
+            nonlocal first, batch, pending, buf
+            tail = buf.strip()
+            buf = ""
+            if tail:
+                emit(tail)
+            flush()
+            if first:
+                # Zero sentences yielded (brain error / empty turn): park
+                # the bus rather than leave it on "thinking" forever.
+                signals.static_stop()
+                signals.set_state("idle")
+            first, batch, pending = True, [], []
+
+        stream = self._client.receive_messages().__aiter__()
+        nxt = asyncio.ensure_future(stream.__anext__())
+        try:
+            while True:
+                done, _ = await asyncio.wait({nxt}, timeout=FLUSH_AFTER)
+                if not done:
+                    if not self._discard_until_result:
+                        flush()      # a pause (tool work): speak what's waiting
+                    await asyncio.wait({nxt})
+                try:
+                    msg = nxt.result()
+                except StopAsyncIteration:
+                    break
+                except Exception as e:
+                    log(f"[brain] reader stream error: {e!r} — rebuilding")
+                    await self._rebuild()
+                    stream = self._client.receive_messages().__aiter__()
+                    nxt = asyncio.ensure_future(stream.__anext__())
+                    continue
+                nxt = asyncio.ensure_future(stream.__anext__())
+                t = type(msg).__name__
+
+                if self._capture is not None:
+                    if t == "AssistantMessage":
+                        for b in getattr(msg, "content", []) or []:
+                            txt = getattr(b, "text", None)
+                            if txt:
+                                self._capture_buf.append(txt)
+                    elif t == "ResultMessage":
+                        self._turn_active = False
+                        self._tally(msg, count_turn=self._capture_count_turn)
+                        self._remember_session(msg)
+                        fut, self._capture = self._capture, None
+                        if fut and not fut.done():
+                            fut.set_result(" ".join(self._capture_buf).strip())
+                    continue
+
+                if t == "StreamEvent":
+                    self._turn_active = True
+                    if self._discard_until_result:
+                        continue
+                    ev = getattr(msg, "event", {}) or {}
+                    kind = ev.get("type")
+                    if kind == "content_block_delta":
+                        delta = ev.get("delta", {}) or {}
+                        if delta.get("type") == "text_delta":
+                            buf += delta.get("text", "")
+                            while True:
+                                m = _SENTENCE_END.search(buf)
+                                if not m:
+                                    break
+                                sentence, buf = (buf[:m.end()].strip(),
+                                                 buf[m.end():])
+                                if sentence:
+                                    emit(sentence)
+                    elif kind == "content_block_stop":
+                        # End of a speech block (e.g. right before a tool
+                        # call): flush NOW, or pre-tool filler sits
+                        # silent through the whole tool run then plays
+                        # glued to the answer.
+                        tail = buf.strip()
+                        buf = ""
+                        if tail:
+                            emit(tail)
+                elif t == "ResultMessage":
+                    was_discarding = self._discard_until_result
+                    self._discard_until_result = False
+                    self._turn_active = False
+                    if was_discarding:
+                        buf = ""
+                        first, batch, pending = True, [], []
+                        # tally/remember still happen: the turn really
+                        # did run and spend usage, it just wasn't spoken.
+                        self._tally(msg)
+                        self._remember_session(msg)
+                        continue
+                    self._tally(msg)
+                    self._remember_session(msg)
+                    await self._pull_rate_limits()
+                    end_turn()
+        finally:
+            if not nxt.done():
+                nxt.cancel()
+
+    async def _rebuild(self):
+        """The stream itself broke (not a turn being interrupted — the
+        underlying receive_messages() iterator raised). Reconnect fresh
+        rather than run with a dead stream for the rest of the session.
+        Loses this voice session's conversation memory; better than a
+        silent voice line."""
+        try:
+            await self._client.disconnect()
+        except Exception:
+            pass
+        self._client = None
+        resume, self._resume_id = None, None   # a desync rebuild never gambles on resume
+        self._client = ClaudeSDKClient(options=ClaudeAgentOptions(
+            cwd=CFG["agent_dir"], model=self.model,
+            system_prompt={"type": "preset", "preset": "claude_code",
+                           "append": DISCIPLINE},
+            include_partial_messages=True,
+            permission_mode=("default" if CFG["permission_mode"] == "ask"
+                             else CFG["permission_mode"]),
+            can_use_tool=self._can_use_tool, add_dirs=CFG["extra_dirs"],
+            skills=CFG["visible_skills"], resume=None))
+        await self._client.connect()
+        log("[brain] reader rebuilt the session after a stream error "
+            "(conversation memory for this session resets)")
 
 
 if __name__ == "__main__":
     import time
 
     async def demo():
-        b = WarmBrain()
+        from backtalk.mouth import Mouth
+        m = Mouth()
+        b = WarmBrain(mouth=m)
         await b.start()
+        t0 = time.time()
         for prompt in ("Voice check: greet me in one sentence.",
                        "And what's two plus two, spoken like yourself?"):
-            t0 = time.time()
-            async for s in b.ask_stream(prompt):
-                print(f"  ({time.time()-t0:4.1f}s) {s}", flush=True)
+            b.ask(prompt)
+            await asyncio.sleep(8)
+        print(f"done in {time.time()-t0:.1f}s, check speakers")
         await b.stop()
 
     asyncio.run(demo())

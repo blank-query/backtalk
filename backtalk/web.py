@@ -96,12 +96,18 @@ class BrowserBridge:
     (real multi-client support) is a small diff, not a rewrite. That
     is explicitly NOT being built now."""
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, on_connect=None, on_disconnect=None):
         self._cfg = cfg
         self._server = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._press_q: "asyncio.Queue[Conn]" = asyncio.Queue()
         self._active: Conn | None = None
+        # Connection-lifecycle hooks, not press-lifecycle: main.py uses
+        # these to route EVERY turn's audio to a connected browser
+        # (see main.py's amain), not just turns that tab itself asked
+        # for — a tab can be listening without ever pressing anything.
+        self._on_connect = on_connect
+        self._on_disconnect = on_disconnect
 
     async def serve(self):
         self._loop = asyncio.get_running_loop()
@@ -110,7 +116,13 @@ class BrowserBridge:
 
         async def handler(ws):
             conn = Conn(ws, self)
-            await conn.reader()   # runs until this connection closes
+            if self._on_connect:
+                self._on_connect(conn)
+            try:
+                await conn.reader()   # runs until this connection closes
+            finally:
+                if self._on_disconnect:
+                    self._on_disconnect(conn)
 
         self._server = await websockets.serve(handler, host, port)
         log(f"[web] browser bridge listening on ws://{host}:{port}")
