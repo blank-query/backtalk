@@ -551,7 +551,19 @@ class Mouth:
         if rate is None:
             return
         try:
-            out = self._get_out(rate) if local_on else None
+            out = None
+            if local_on:
+                try:
+                    out = self._get_out(rate)
+                except Exception as e:
+                    # No local device to open (e.g. a headless box with
+                    # no audio hardware at all) must degrade to
+                    # remote-only, not take the whole sentence down
+                    # before remote_sink is ever called — the same
+                    # "one destination's failure can't kill the other"
+                    # rule already applied to a dead browser socket.
+                    tail = " — continuing remote-only" if remote_sink else ""
+                    log(f"[mouth] local output unavailable ({e}){tail}")
             # AUDIO STARTS HERE: the head buffer is full and the first write
             # is next. Publishing now is what puts a screen cue on the spoken
             # word rather than seconds ahead of it.
