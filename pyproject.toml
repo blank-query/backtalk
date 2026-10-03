@@ -25,6 +25,7 @@ dependencies = [
     # same code with binary wheels, importing as the identical module.
     "webrtcvad>=2.0.10 ; sys_platform != 'win32'",
     "webrtcvad-wheels>=2.0.10 ; sys_platform == 'win32'",
+    "websockets>=12.0",
 ]
 
 [tool.setuptools]

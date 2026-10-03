@@ -187,6 +187,22 @@ DEFAULTS = {
     # .voice_waveform, .voice_loading_pid) — anything can watch them;
     # visualizers pair with this contract. Default: the repo root.
     "signals_dir": "",
+    # THE BROWSER BRIDGE: a second push-to-talk, a click or tap on the
+    # Jarvis face in ai-visualizer instead of (or alongside) the key.
+    # OFF by default. Localhost only for now — host/port are
+    # configurable so pointing this at a Tailscale IP later is a
+    # one-line config change, not a code change, but exposing it
+    # beyond this machine is not yet a supported, tested path.
+    "web": {
+        "enabled": False,
+        "host": "127.0.0.1",
+        "port": 8792,
+        # When a turn was triggered from the browser, also play the
+        # reply through the local speakers (not just back to the
+        # browser tab). True is the friendlier default: you might be
+        # standing right at the machine when you also tap the face.
+        "local_playback_on_remote_turn": True,
+    },
     # THE BAREHANDS SEAM: point this at a barehands checkout's state/
     # folder and its on-screen ring becomes your agent's face — it
     # breathes while idle, spins while thinking, pulses with the voice.

@@ -353,19 +353,25 @@ class Mouth:
     def say(self, text: str):
         """Queue text (split to sentences) for speech."""
         for s in split_sentences(text):
-            self._q.put((s, None))
+            self._q.put((s, None, None))
 
-    def say_chunk(self, text: str, directions=None):
+    def say_chunk(self, text: str, directions=None, remote_sink=None):
         """Queue text as ONE TTS request, no sentence splitting — fuller
         chunks get livelier prosody (single short sentences come out
         dull).
 
         `directions` are the stage directions this chunk carried. They are
         published on the signal bus when this chunk's audio STARTS, which
-        is why they travel with it instead of firing at parse time."""
+        is why they travel with it instead of firing at parse time.
+
+        `remote_sink`, when the turn came from the browser bridge, is a
+        (rate, pcm) -> None callable that also receives this chunk's
+        audio — queued per-item (not a global flag) so it can never leak
+        onto an unrelated later turn if an interrupt and a fresh turn
+        overlap."""
         text = text.strip()
         if text:
-            self._q.put((text, directions or None))
+            self._q.put((text, directions or None, remote_sink))
 
     def shut_up(self):
         """Barge-in: stop current playback and flush everything queued."""
@@ -395,7 +401,13 @@ class Mouth:
         from backtalk import signals
         while True:
             item = self._q.get()
-            sentence, directions = item if isinstance(item, tuple) else (item, None)
+            if isinstance(item, tuple) and len(item) == 3:
+                sentence, directions, remote_sink = item
+            elif isinstance(item, tuple):
+                sentence, directions = item
+                remote_sink = None
+            else:
+                sentence, directions, remote_sink = item, None, None
             if not sentence:
                 continue
             self._stop.clear()
@@ -404,12 +416,14 @@ class Mouth:
             signals.static_stop()     # thinking sound dies when speech starts
             signals.set_state("speaking")
             try:
-                self._play_stream(sentence, directions)
+                self._play_stream(sentence, directions, remote_sink=remote_sink)
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
                 if self._q.empty():
                     self._speaking.clear()
+                    if remote_sink is not None:
+                        remote_sink.reply_done()
                     # The reply has genuinely stopped talking, as opposed to
                     # the gap between two sentences of the same reply.
                     signals.reply_done()
@@ -466,11 +480,18 @@ class Mouth:
         self._out_rate = None
 
     def _play_stream(self, sentence: str, directions=None, block: int = 2205,
-                     prebuffer_s: float = 0.75):
+                     prebuffer_s: float = 0.75, remote_sink=None):
         """Stream-synthesize and play with the head-start buffer (audio
         law #2). stop() reacts ~50ms. The sample rate comes from
-        whichever engine actually answered."""
+        whichever engine actually answered.
+
+        `remote_sink`, when set, also gets every chunk (see
+        say_chunk). Its own send failures are its problem, never
+        ours — a dead browser socket must never take down the local
+        output stream below."""
         from backtalk import signals
+        local_on = bool(CFG.get("web", {}).get(
+            "local_playback_on_remote_turn", True)) or remote_sink is None
         gen = synth_stream(sentence)
         head: list = []
         banked = 0
@@ -484,7 +505,7 @@ class Mouth:
         if rate is None:
             return
         try:
-            out = self._get_out(rate)
+            out = self._get_out(rate) if local_on else None
             # AUDIO STARTS HERE: the head buffer is full and the first write
             # is next. Publishing now is what puts a screen cue on the spoken
             # word rather than seconds ahead of it.
@@ -496,13 +517,17 @@ class Mouth:
                 for i in range(0, len(pcm), block):
                     if self._stop.is_set():
                         return False
-                    out.write(pcm[i:i + block])
+                    block_pcm = pcm[i:i + block]
+                    if out is not None:
+                        out.write(block_pcm)
                     # Re-check after the blocking write: a barge-in
                     # landing mid-block must not let feed_waveform
                     # re-assert "speaking" over a fresh "listening".
                     if self._stop.is_set():
                         return False
-                    signals.feed_waveform(pcm[i:i + block])
+                    signals.feed_waveform(block_pcm)
+                    if remote_sink is not None:
+                        remote_sink(rate, block_pcm)
                 return True
             for pcm in head:
                 if not _write(pcm):
