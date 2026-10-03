@@ -786,10 +786,13 @@ async def amain():
                 mouth.say(say_after)
         signals.set_state("idle")
 
-    async def handle(text: str, spoke_from: float | None = None) -> bool:
+    async def handle(text: str, spoke_from: float | None = None,
+                     interrupt: bool = True) -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
-        told apart from speech that began before the ask even existed."""
+        told apart from speech that began before the ask even existed.
+        interrupt=False is a QUEUED browser tap (Part 2): touch nothing
+        already playing, just line this one up behind it."""
         log(f"[you]    {text}")
         # A pending spoken permission ask owns the next utterance IF
         # that utterance started after the ask was posed. Speech that
@@ -828,16 +831,20 @@ async def amain():
         if any(q in text.lower() for q in QUIT_PHRASES):
             await brain.interrupt()
             mouth.shut_up()
+            if brain.remote_sink is not None:
+                brain.remote_sink.stop()
             mouth.say(CFG["signoff"])
             mouth.wait_done(timeout=15)
             return False
-        if brain.turn_active:
+        if interrupt and brain.turn_active:
             # The reader (brain.py) owns speaking now — interrupt() is
             # a clean async call, nothing here to cancel-and-await.
             log("[turn] interrupted mid-reply by new input")
             _deny_pending()          # an ask never outlives its turn
             await brain.interrupt()
             mouth.shut_up()
+            if brain.remote_sink is not None:
+                brain.remote_sink.stop()
         verb = verb or console_match(text)
         if verb:
             await run_console(verb)
@@ -889,18 +896,24 @@ async def amain():
         ws_press_fut: asyncio.Future | None = None
         mic_gen_seen = _MIC["gen"]
 
-        async def _begin_capture():
-            """Shared by the local key and a browser press: interrupt
-            any live reply (unless a permission ask is pending — that
-            TURN stays alive; the press only silences playback), duck,
-            and mark the mic busy so the open mic (if any) yields."""
-            perm_wait = (_PERM["fut"] is not None
-                         and not _PERM["fut"].done())
-            if brain.turn_active and not perm_wait:
-                log("[turn] interrupted mid-reply — new capture started")
-                await brain.interrupt()
-            mouth.shut_up()
-            signals.static_stop()
+        async def _begin_capture(interrupt: bool = True):
+            """Shared by the local key and a browser press. The local
+            key always interrupts (dev tool, unchanged). A browser
+            press interrupts only for the Interrupt button; a plain
+            tap passes interrupt=False and this becomes a no-op on
+            anything already playing — the recording still happens,
+            it just queues instead (Part 2). Either way: duck, and
+            mark the mic busy so the open mic (if any) yields."""
+            if interrupt:
+                perm_wait = (_PERM["fut"] is not None
+                             and not _PERM["fut"].done())
+                if brain.turn_active and not perm_wait:
+                    log("[turn] interrupted mid-reply — new capture started")
+                    await brain.interrupt()
+                    if brain.remote_sink is not None:
+                        brain.remote_sink.stop()
+                mouth.shut_up()
+                signals.static_stop()
             signals.set_state("listening")
             mouth.ducker.speech_start()
             _MIC["btn"] = True
@@ -1000,10 +1013,11 @@ async def amain():
                     return
                 continue
             if ws_press_fut is not None and ws_press_fut in done:
-                conn = ws_press_fut.result(); ws_press_fut = None
+                conn, is_interrupt = ws_press_fut.result(); ws_press_fut = None
                 press_t = time.monotonic()
-                await _begin_capture()
-                log("[web] recording (release to send)...")
+                await _begin_capture(interrupt=is_interrupt)
+                log("[web] recording (release to send)..."
+                    + ("" if is_interrupt else " (queued)"))
                 g = _MIC["gen"]
                 try:
                     pcm = await bridge.record_until_release(
@@ -1024,9 +1038,13 @@ async def amain():
                 mouth.ducker.speech_end(0.2)
                 if not text:
                     log("[web] (tap or empty — ignored)")
-                    signals.set_state("idle")
+                    if is_interrupt:
+                        signals.set_state("idle")
+                    # else: a queued tap that came up empty shouldn't
+                    # stomp on whatever Jarvis is legitimately doing
                     continue
-                if not await handle(text, spoke_from=press_t):
+                if not await handle(text, spoke_from=press_t,
+                                    interrupt=is_interrupt):
                     return
     except KeyboardInterrupt:
         pass

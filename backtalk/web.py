@@ -27,10 +27,18 @@ press as another input source feeding the SAME turn-handling path, not
 a parallel reimplementation of it.
 
 Wire protocol, deliberately tiny:
-  text frame  {"type": "press"}             browser -> server
+  text frame  {"type": "press"}             browser -> server (queue)
+  text frame  {"type": "interrupt_press"}   browser -> server (the
+                                             Interrupt button: stop the
+                                             current turn first, THEN
+                                             record)
   text frame  {"type": "release"}           browser -> server
   binary      <uint32 LE rate><int16 LE PCM...>   either direction
   text frame  {"type": "reply_done"}        server -> browser
+  text frame  {"type": "stop"}              server -> browser (an
+                                             interrupt: discard every
+                                             scheduled-but-unplayed
+                                             chunk already sent)
 
 Every binary frame carries its own sample rate rather than assuming
 16000, because a browser's actual capture rate is a cross-browser
@@ -77,7 +85,9 @@ class Conn:
                     continue
                 kind = data.get("type")
                 if kind == "press":
-                    self.bridge._on_press(self)
+                    self.bridge._on_press(self, interrupt=False)
+                elif kind == "interrupt_press":
+                    self.bridge._on_press(self, interrupt=True)
                 elif kind == "release":
                     self._released.set()
         except websockets.exceptions.ConnectionClosed:
@@ -100,7 +110,7 @@ class BrowserBridge:
         self._cfg = cfg
         self._server = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._press_q: "asyncio.Queue[Conn]" = asyncio.Queue()
+        self._press_q: "asyncio.Queue[tuple[Conn, bool]]" = asyncio.Queue()
         self._active: Conn | None = None
         # Connection-lifecycle hooks, not press-lifecycle: main.py uses
         # these to route EVERY turn's audio to a connected browser
@@ -128,24 +138,29 @@ class BrowserBridge:
         log(f"[web] browser bridge listening on ws://{host}:{port}")
         await self._server.wait_closed()
 
-    def _on_press(self, conn: Conn):
+    def _on_press(self, conn: Conn, interrupt: bool = False):
         """Called synchronously from within conn.reader(), already on
-        the event loop — no thread hop needed here."""
+        the event loop — no thread hop needed here. `interrupt` is the
+        Interrupt button (stop the current turn, then record) versus a
+        plain tap (queue behind it, touch nothing). This guard is about
+        overlapping RECORDINGS on one connection, not overlapping
+        turns — a press queues fine the instant the PREVIOUS press's
+        recording ends, long before that turn's reply is spoken."""
         if self._active is not None and not self._active.disconnected:
-            log("[web] press ignored — another browser turn is live")
+            log("[web] press ignored — another browser recording is live")
             return
         self._active = conn
         conn._released.clear()
         while not conn._frames.empty():
             conn._frames.get_nowait()   # drop anything stale from before this press
-        self._press_q.put_nowait(conn)
+        self._press_q.put_nowait((conn, interrupt))
 
     async def stop(self):
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
 
-    async def wait_press(self) -> Conn:
+    async def wait_press(self) -> tuple[Conn, bool]:
         return await self._press_q.get()
 
     async def record_until_release(self, conn: Conn, abort=None) -> np.ndarray | None:
@@ -206,5 +221,18 @@ class BrowserBridge:
             except Exception:
                 pass
 
+        def _stop():
+            """An interrupt: tell the browser to discard every chunk
+            already sent but not yet played — mirrors mouth.shut_up()
+            on this end."""
+            if conn.disconnected or loop is None:
+                return
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    conn.ws.send(json.dumps({"type": "stop"})), loop)
+            except Exception:
+                pass
+
         _sink.reply_done = _reply_done
+        _sink.stop = _stop
         return _sink
