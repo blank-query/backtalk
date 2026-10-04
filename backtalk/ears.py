@@ -346,9 +346,17 @@ def transcribe(pcm: np.ndarray, vad: bool = False) -> str:
         # repetitive result gets re-decoded at a higher temperature
         # (whisper's compression-ratio fallback, which a lone 0.0 turned
         # off), and no window is conditioned on the last one's words.
+        # Optional tuning, passed only when set: stt_beam_size 1 is ~30%
+        # faster at the same accuracy on a Pi 5 (base.en, measured);
+        # stt_hotwords nudges recognition toward names ("home server" was
+        # heard as "Piners").
+        extra = {k: CFG[c] for k, c in (("beam_size", "stt_beam_size"),
+                                        ("hotwords", "stt_hotwords"))
+                 if CFG.get(c)}
         segments, _ = model.transcribe(audio, language=lang, vad_filter=vad,
                                        temperature=(0.0, 0.2, 0.4, 0.6),
-                                       condition_on_previous_text=False)
+                                       condition_on_previous_text=False,
+                                       **extra)
         text = "".join(s.text for s in segments).strip()
     return _NONSPEECH.sub("", text).strip()
 

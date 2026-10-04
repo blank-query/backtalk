@@ -147,6 +147,11 @@ DEFAULTS = {
     # "auto" uses CUDA when present, otherwise CPU. int8 keeps CPU fast.
     "stt_device": "auto",
     "stt_compute": "int8",
+    # Optional: 1 = greedy decoding (faster, for small hardware; the
+    # default 0 leaves faster-whisper's own beam of 5), and words to
+    # bias recognition toward, space-separated ("Jarvis home server").
+    "stt_beam_size": 0,
+    "stt_hotwords": "",
     # The microphone to record from, matched by NAME. "" means whatever
     # the OS calls the default input, which is right on most machines.
     #
