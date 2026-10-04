@@ -12,6 +12,12 @@ This is a fork of [jaredrhod/backtalk](https://github.com/jaredrhod/backtalk). E
 
 To run the whole stack in Docker on a home server, see [`docker/` in this fullstack-agent fork](https://github.com/blank-query/network-fullstack-agent/tree/remote/docker).
 
+---
+
+**End of this fork's notes. Everything below is the original README by [jaredrhod](https://github.com/jaredrhod), unchanged.**
+
+---
+
 > **Never used Claude Code?** Start at [jaredrhod.com](https://jaredrhod.com): pick your situation and it routes you to the right path.
 
 **Runs on:** Claude Code only; the voice is built on Claude's agent SDK. The $20 Pro plan is enough.
