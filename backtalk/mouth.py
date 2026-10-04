@@ -347,7 +347,13 @@ def _stream_piper(text: str):
     it rather than a module-level constant."""
     voice = warm_piper()
     rate = voice.config.sample_rate
-    for chunk in voice.synthesize(text):
+    pp = CFG["piper"]
+    syn = None
+    if pp.get("speaker_id") is not None or pp.get("length_scale") is not None:
+        from piper import SynthesisConfig
+        syn = SynthesisConfig(speaker_id=pp.get("speaker_id"),
+                              length_scale=pp.get("length_scale"))
+    for chunk in voice.synthesize(text, syn_config=syn):
         a = chunk.audio_int16_array
         if len(a):
             yield rate, a

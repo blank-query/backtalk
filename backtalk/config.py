@@ -195,6 +195,13 @@ DEFAULTS = {
         # alongside it). Get one with:
         # python -m piper.download_voices <voice> --download-dir <dir>
         "model_path": "",
+        # Multi-speaker voices (e.g. en_GB-semaine-medium) pick a speaker
+        # by number, from the model's .onnx.json speaker_id_map. None =
+        # the voice's default.
+        "speaker_id": None,
+        # Speaking pace: below 1.0 is faster (0.82 = about 18% faster).
+        # None = the voice's own default.
+        "length_scale": None,
     },
     # Where the signal-bus files are written (.voice_state,
     # .voice_waveform, .voice_loading_pid) — anything can watch them;
