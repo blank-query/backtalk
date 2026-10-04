@@ -405,6 +405,24 @@ class WarmBrain:
         pending: list[str] = []
         buf = ""
         turn_sink = None   # resolved at this turn's first content, below
+        # The turn's content blocks in order, [type, chars of thinking].
+        # Logged once per turn: an answer written only as reasoning (a
+        # thinking block, then a tool call, no text) is never spoken, and
+        # this line is how that gets caught (seen once, 2026-10-04).
+        shape: list = []
+
+        def log_shape():
+            nonlocal shape
+            if shape:
+                desc = " ".join(f"{b}({n})" if b == "thinking" and n else b for b, n in shape)
+                first_tool = next((i for i, (b, _) in enumerate(shape) if b == "tool_use"), len(shape))
+                head = shape[:first_tool]
+                if first_tool < len(shape) and not any(b == "text" for b, _ in head) \
+                        and any(b == "thinking" and n for b, n in head):
+                    log(f"[turn] WARNING: reasoning but no spoken text before the first tool call: {desc}")
+                else:
+                    log(f"[turn] blocks: {desc}")
+            shape = []
 
         def flush():
             nonlocal batch, pending
@@ -516,8 +534,12 @@ class WarmBrain:
                         continue
                     ev = getattr(msg, "event", {}) or {}
                     kind = ev.get("type")
-                    if kind == "content_block_delta":
+                    if kind == "content_block_start":
+                        shape.append([(ev.get("content_block") or {}).get("type", "?"), 0])
+                    elif kind == "content_block_delta":
                         delta = ev.get("delta", {}) or {}
+                        if delta.get("type") == "thinking_delta" and shape:
+                            shape[-1][1] += len(delta.get("thinking", ""))
                         if delta.get("type") == "text_delta":
                             buf += delta.get("text", "")
                             while True:
@@ -541,6 +563,7 @@ class WarmBrain:
                     was_discarding = self._discard_until_result
                     self._discard_until_result = False
                     self._turn_active = False
+                    log_shape()
                     # This turn is over: nobody's question is in flight
                     # until the next dispatch stamps one. Clearing here
                     # (before any next dispatch) means an UNPROMPTED turn
