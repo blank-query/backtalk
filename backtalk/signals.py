@@ -25,6 +25,8 @@ is the whole integration surface:
   .voice_loading_pid  exists while the thinking sound is playing
   .voice_rate_limits  JSON {window: {utilization, resets_at}} — only
                       written when show_usage is on
+  .voice_mic_mode     ptt | open | paused (paused wins over open, open
+                      over ptt, across the local mic and every tab)
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
@@ -56,6 +58,7 @@ _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 _TASKS_FILE = os.path.join(_DIR, ".voice_tasks")
 _ACTIVE_CONN_FILE = os.path.join(_DIR, ".voice_active_conn")
+_MIC_MODE_FILE = os.path.join(_DIR, ".voice_mic_mode")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -81,6 +84,15 @@ def set_state(name: str):
                 f.write(name)
         except OSError:
             pass
+
+
+def set_mic_mode(mode: str):
+    """ptt | open | paused, for a glance-at-it display. Never raises."""
+    try:
+        with open(_MIC_MODE_FILE, "w") as f:
+            f.write(mode)
+    except OSError:
+        pass
 
 
 def set_tasks(n: int):

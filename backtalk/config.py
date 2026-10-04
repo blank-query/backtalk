@@ -152,6 +152,14 @@ DEFAULTS = {
     # bias recognition toward, space-separated ("Jarvis home server").
     "stt_beam_size": 0,
     "stt_hotwords": "",
+    # "whisper" (default) or "moonshine": Moonshine v2 streams, so the
+    # text is ready ~0.4 s after you stop talking even on a Pi 5 (vs ~2 s
+    # for whisper base there). Needs `pip install moonshine-voice`; falls
+    # back to whisper if it won't load. moonshine_model: TINY_STREAMING /
+    # SMALL_STREAMING / MEDIUM_STREAMING (medium can't keep up on a Pi).
+    "stt_engine": "whisper",
+    "moonshine_model": "SMALL_STREAMING",
+    "moonshine_cache": "",
     # The microphone to record from, matched by NAME. "" means whatever
     # the OS calls the default input, which is right on most machines.
     #

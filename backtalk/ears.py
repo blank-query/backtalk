@@ -26,6 +26,7 @@ an utterance opens after ~120ms of sustained speech, closes after
 listening (so the open mic ignores the speakers unless barge-in is on).
 """
 import platform
+import queue
 import re
 import sys
 import threading
@@ -278,6 +279,8 @@ def warm():
     utterance doesn't pay the load."""
     global _model, _backend
     check_microphone()
+    if _moonshine() is not None:
+        return None          # whisper only loads if moonshine can't
     with _model_lock:
         if _model is None:
             if _apple_gpu_available():
@@ -361,6 +364,94 @@ def transcribe(pcm: np.ndarray, vad: bool = False) -> str:
     return _NONSPEECH.sub("", text).strip()
 
 
+# ---- Moonshine (stt_engine "moonshine"): one model, one stream per capture.
+_moon = None            # the loaded moonshine_voice.Transcriber, or False
+_moon_lock = threading.Lock()   # one inference at a time across streams
+
+
+def _moonshine():
+    """The shared Moonshine transcriber, loaded once; None when the
+    engine isn't moonshine or it won't load (whisper takes over)."""
+    global _moon
+    if CFG.get("stt_engine") != "moonshine" or _moon is False:
+        return None
+    with _moon_lock:
+        if _moon is None:
+            try:
+                import moonshine_voice as mv
+                arch = getattr(mv.ModelArch, CFG.get("moonshine_model") or "SMALL_STREAMING")
+                log(f"[ears] loading moonshine {arch.name.lower()}...")
+                path, arch = mv.get_model_for_language(
+                    "en", arch, cache_root=CFG.get("moonshine_cache") or None)
+                _moon = mv.Transcriber(path, arch, update_interval=0.3)
+                log("[ears] moonshine ready")
+            except Exception as e:
+                log(f"[ears] moonshine unavailable ({e!r}); using whisper")
+                _moon = False
+    return _moon or None
+
+
+def _has_speech(pcm: np.ndarray) -> bool:
+    """Silero's verdict, for the open mic on the moonshine path (whisper
+    gets the same through vad_filter)."""
+    from faster_whisper.vad import get_speech_timestamps
+    return bool(get_speech_timestamps(pcm.astype(np.float32) / 32768.0))
+
+
+class Session:
+    """One utterance, fed while it's being captured; finish() returns
+    its text. With Moonshine the audio streams into the model as it
+    arrives (on a worker thread, so add() never blocks a capture loop or
+    the event loop), leaving only the last moment to process at the end.
+    With whisper it just collects the audio and transcribes at the end."""
+
+    def __init__(self, vad: bool = False):
+        self.vad, self.frames = vad, []
+        self._moon = _moonshine()
+        self._q = None
+        if self._moon is not None:
+            with _moon_lock:
+                self._stream = self._moon.create_stream(update_interval=0.3)
+                self._stream.start()
+            self._q = queue.Queue()
+            self._worker = threading.Thread(target=self._feed, daemon=True)
+            self._worker.start()
+
+    def _feed(self):
+        while (pcm := self._q.get()) is not None:
+            with _moon_lock:
+                self._stream.add_audio((pcm.astype(np.float32) / 32768.0).tolist(), RATE)
+
+    def add(self, pcm: np.ndarray):
+        self.frames.append(pcm)
+        if self._q is not None:
+            self._q.put(pcm)
+
+    def cancel(self):
+        if self._q is not None:
+            self._q.put(None)
+            self._worker.join()
+            with _moon_lock:
+                self._stream.stop(); self._stream.close()
+            self._q = None
+
+    def finish(self) -> str:
+        pcm = (np.concatenate(self.frames) if self.frames
+               else np.zeros(0, dtype=np.int16))
+        if self._q is None:
+            return transcribe(pcm, vad=self.vad) if len(pcm) else ""
+        self._q.put(None)
+        self._worker.join()
+        with _moon_lock:
+            out = self._stream.stop()
+            self._stream.close()
+        self._q = None
+        if self.vad and not _has_speech(pcm):
+            return ""
+        text = " ".join(l.text for l in (out.lines if out else [])).strip()
+        return _NONSPEECH.sub("", text).strip()
+
+
 class Ears:
     def __init__(self, aggressiveness: int = 2, silence_ms: int = 480):
         self.vad = webrtcvad.Vad(aggressiveness)
@@ -378,57 +469,67 @@ class Ears:
         a browser's hands-free stream (web.ListenStream)."""
         frames: list[np.ndarray] = []
         ring: list[np.ndarray] = []   # pre-roll so the first syllable survives
+        session = None
         speech_run = 0
         silence_run = 0
         speech_total = 0
         in_utterance = False
         elapsed = 0.0
 
-        with (stream or _open_mic()) as stream:
-            while True:
-                block, _ = stream.read(FRAME_LEN)
-                elapsed += FRAME_MS / 1000
-                if abort and abort():
-                    return None
-                if timeout_s and elapsed > timeout_s and not in_utterance:
-                    return None
-                mono = block[:, 0].copy()
-                if gate and gate():
-                    # speakers are talking and barge-in isn't on: ignore
-                    ring.clear()
-                    continue
-                is_speech = self.vad.is_speech(mono.tobytes(), RATE)
-                if not in_utterance:
-                    ring.append(mono)
-                    if len(ring) > 8:
-                        ring.pop(0)
-                    speech_run = speech_run + 1 if is_speech else 0
-                    if speech_run >= OPEN_FRAMES:
-                        in_utterance = True
-                        frames = ring[:]
-                        silence_run = 0
-                else:
-                    frames.append(mono)
-                    if is_speech:
-                        speech_total += 1
-                        silence_run = 0
+        try:
+            with (stream or _open_mic()) as stream:
+                while True:
+                    block, _ = stream.read(FRAME_LEN)
+                    elapsed += FRAME_MS / 1000
+                    if abort and abort():
+                        return None
+                    if timeout_s and elapsed > timeout_s and not in_utterance:
+                        return None
+                    mono = block[:, 0].copy()
+                    if gate and gate():
+                        # speakers are talking and barge-in isn't on: ignore
+                        ring.clear()
+                        continue
+                    is_speech = self.vad.is_speech(mono.tobytes(), RATE)
+                    if not in_utterance:
+                        ring.append(mono)
+                        if len(ring) > 8:
+                            ring.pop(0)
+                        speech_run = speech_run + 1 if is_speech else 0
+                        if speech_run >= OPEN_FRAMES:
+                            in_utterance = True
+                            frames = ring[:]
+                            silence_run = 0
+                            session = Session(vad=True)
+                            for f in frames:
+                                session.add(f)
                     else:
-                        silence_run += 1
-                    if silence_run >= self.silence_frames or \
-                       len(frames) * FRAME_MS / 1000 > MAX_UTTER_S:
-                        if speech_total < 8:
-                            # <240ms of actual speech: a noise blip, not
-                            # a sentence — keep listening
-                            in_utterance = False
-                            frames, ring = [], []
-                            speech_run = speech_total = 0
-                            continue
-                        text = transcribe(np.concatenate(frames), vad=True)
-                        words = re.findall(r"[a-z']+", text.lower())
-                        if words and all(_WAIL.fullmatch(w) for w in words):
-                            log(f"[ears] ignored a wail: {text[:40]!r}")
-                            return ""
-                        return text
+                        frames.append(mono)
+                        session.add(mono)
+                        if is_speech:
+                            speech_total += 1
+                            silence_run = 0
+                        else:
+                            silence_run += 1
+                        if silence_run >= self.silence_frames or \
+                           len(frames) * FRAME_MS / 1000 > MAX_UTTER_S:
+                            if speech_total < 8:
+                                # <240ms of actual speech: a noise blip, not
+                                # a sentence — keep listening
+                                in_utterance = False
+                                frames, ring = [], []
+                                speech_run = speech_total = 0
+                                session.cancel(); session = None
+                                continue
+                            text = session.finish(); session = None
+                            words = re.findall(r"[a-z']+", text.lower())
+                            if words and all(_WAIL.fullmatch(w) for w in words):
+                                log(f"[ears] ignored a wail: {text[:40]!r}")
+                                return ""
+                            return text
+        finally:
+            if session is not None:      # aborted mid-utterance
+                session.cancel()
 
 
 def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None:
@@ -436,17 +537,23 @@ def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None
     then transcribe. The button is the VAD — no endpointing. Returns
     None for taps shorter than min_s (accidental presses)."""
     frames: list[np.ndarray] = []
-    with _open_mic() as stream:
-        while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
-            block, _ = stream.read(FRAME_LEN)
-            frames.append(block[:, 0].copy())
-        # a small tail so the last word isn't clipped at release
-        for _ in range(6):
-            block, _ = stream.read(FRAME_LEN)
-            frames.append(block[:, 0].copy())
+    session = Session()
+    try:
+        with _open_mic() as stream:
+            while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
+                block, _ = stream.read(FRAME_LEN)
+                frames.append(block[:, 0].copy()); session.add(frames[-1])
+            # a small tail so the last word isn't clipped at release
+            for _ in range(6):
+                block, _ = stream.read(FRAME_LEN)
+                frames.append(block[:, 0].copy()); session.add(frames[-1])
+    except BaseException:
+        session.cancel()
+        raise
     if len(frames) * FRAME_MS / 1000 < min_s:
+        session.cancel()
         return None
-    return transcribe(np.concatenate(frames))
+    return session.finish()
 
 
 if __name__ == "__main__":

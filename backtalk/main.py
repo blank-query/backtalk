@@ -66,8 +66,8 @@ import time
 from backtalk import signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
-from backtalk.ears import (Ears, explain_audio_failure, record_held,
-                           transcribe, warm as warm_ears)
+from backtalk.ears import (Ears, Session, explain_audio_failure, record_held,
+                           warm as warm_ears)
 from backtalk.mouth import Mouth
 from backtalk.ptt import PTTListener
 from backtalk.vlog import log
@@ -1195,12 +1195,17 @@ async def amain():
                 log("[web] recording (release to send)..."
                     + ("" if is_interrupt else " (queued)"))
                 g = _MIC["gen"]
+                session = Session()
                 try:
                     pcm = await bridge.record_until_release(
-                        conn, abort=lambda: _MIC["gen"] != g)
-                    text = (await loop.run_in_executor(None, transcribe, pcm)
+                        conn, abort=lambda: _MIC["gen"] != g,
+                        on_audio=session.add)
+                    if pcm is None:
+                        session.cancel()
+                    text = (await loop.run_in_executor(None, session.finish)
                             if pcm is not None else None)
                 except Exception as e:
+                    session.cancel()
                     if explain_audio_failure(e):
                         mouth.say("I can't hear you. There's no working "
                                   "microphone I can use.")

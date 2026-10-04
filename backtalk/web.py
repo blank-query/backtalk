@@ -229,8 +229,11 @@ class BrowserBridge:
     async def wait_press(self) -> tuple[Conn, bool]:
         return await self._press_q.get()
 
-    async def record_until_release(self, conn: Conn, abort=None) -> np.ndarray | None:
+    async def record_until_release(self, conn: Conn, abort=None,
+                                   on_audio=None) -> np.ndarray | None:
         """Collect PCM frames until release, disconnect, or abort().
+        `on_audio`, if given, also gets each 16 kHz chunk as it arrives
+        (a streaming transcriber; see ears.Session).
         Resamples any frame whose declared rate isn't already 16000
         (defense against browser/engine quirks) via stdlib audioop —
         no new dependency. Returns None on no audio at all."""
@@ -262,6 +265,8 @@ class BrowserBridge:
                     pcm_bytes, resample_state = audioop.ratecv(
                         pcm_bytes, 2, 1, rate, RATE, resample_state)
                 frames.append(np.frombuffer(pcm_bytes, dtype=np.int16))
+                if on_audio is not None:
+                    on_audio(frames[-1])
         finally:
             conn.recording = False
         if not frames:
