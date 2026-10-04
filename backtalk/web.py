@@ -47,6 +47,20 @@ Wire protocol, deliberately tiny:
                                              interrupt: discard every
                                              scheduled-but-unplayed
                                              chunk already sent)
+  text frame  {"type": "unmute"}            browser -> server: a click
+                                             while paused ("stop
+                                             listening"); hands-free
+                                             comes back
+  text frame  {"type": "listen", "on": b,   server -> browser: hands-
+               "muted": b}
+                                             free on or off for that
+                                             tab. While on, the tab
+                                             streams its mic (echo
+                                             cancellation ON)
+                                             continuously; frames
+                                             outside a press feed
+                                             ListenStream, and the voice
+                                             line does the endpointing.
 
 Every binary frame carries its own sample rate rather than assuming
 16000, because a browser's actual capture rate is a cross-browser
@@ -60,6 +74,7 @@ one loop — never iterate `conn.ws` a second time anywhere else.
 import asyncio
 import audioop
 import json
+import queue
 import struct
 
 import numpy as np
@@ -84,6 +99,11 @@ class Conn:
         self.id = None
         self.disconnected = False
         self.recording = False   # this tab's own slot, not bridge-wide
+        self.listening = False   # hands-free: frames outside a press
+        self.listen_muted = False   # paused: hearing only "start listening"
+        # Read from a worker thread (ListenStream), hence queue.Queue.
+        # Bounded: a stalled listener drops audio, never memory.
+        self._listen_q: "queue.Queue[bytes]" = queue.Queue(maxsize=500)
         self._frames: "asyncio.Queue" = asyncio.Queue()
         self._released = asyncio.Event()
 
@@ -92,7 +112,13 @@ class Conn:
         try:
             async for msg in self.ws:
                 if isinstance(msg, (bytes, bytearray)):
-                    await self._frames.put(bytes(msg))
+                    if self.recording:
+                        await self._frames.put(bytes(msg))
+                    elif self.listening:
+                        try:
+                            self._listen_q.put_nowait(bytes(msg))
+                        except queue.Full:
+                            pass
                     continue
                 try:
                     data = json.loads(msg)
@@ -101,12 +127,16 @@ class Conn:
                 kind = data.get("type")
                 if kind == "hello":
                     self.id = data.get("device_id") or self.id
+                    if self.id in self.bridge._hf_ids:
+                        self.bridge.set_listening(self, True)
                 elif kind == "press":
                     self.bridge._on_press(self, interrupt=False)
                 elif kind == "interrupt_press":
                     self.bridge._on_press(self, interrupt=True)
                 elif kind == "release":
                     self._released.set()
+                elif kind == "unmute" and self.listen_muted:
+                    self.bridge.set_listening(self, True)
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
@@ -128,6 +158,11 @@ class BrowserBridge:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._press_q: "asyncio.Queue[tuple[Conn, bool]]" = asyncio.Queue()
         self._conns: set[Conn] = set()
+        # Devices in hands-free, by the browser's own token, so a reload
+        # or reconnect comes back listening. Memory only: a voice-line
+        # restart returns every browser to push-to-talk.
+        self._hf_ids: set[str] = set()
+        self.on_listen = None   # main.py: start a listener for a Conn
 
     async def serve(self):
         self._loop = asyncio.get_running_loop()
@@ -163,6 +198,28 @@ class BrowserBridge:
         while not conn._frames.empty():
             conn._frames.get_nowait()   # drop anything stale from before this press
         self._press_q.put_nowait((conn, interrupt))
+
+    def set_listening(self, conn: Conn, on: bool, muted: bool = False):
+        """Hands-free on or off for one tab. Call on the event loop.
+        on + muted is paused ("stop listening"): the tab keeps
+        streaming, but main.py acts on nothing except "start
+        listening", and a click on the face also resumes."""
+        conn.listening, conn.listen_muted = on, muted and on
+        if conn.id:
+            if on:
+                self._hf_ids.add(conn.id)
+            else:
+                self._hf_ids.discard(conn.id)
+        if not on:
+            while not conn._listen_q.empty():
+                conn._listen_q.get_nowait()
+        asyncio.ensure_future(
+            conn.ws.send(json.dumps({"type": "listen", "on": on,
+                                     "muted": conn.listen_muted})))
+        log(f"[web] hands-free {'off' if not on else 'paused' if muted else 'on'}"
+            f" for {str(conn.id)[:8]}")
+        if on and self.on_listen is not None:
+            self.on_listen(conn)
 
     async def stop(self):
         if self._server is not None:
@@ -251,6 +308,7 @@ class BrowserBridge:
         _sink.reply_done = _reply_done
         _sink.stop = _stop
         _sink.conn_id = conn.id
+        _sink.conn = conn
         # Live lookup, not a snapshot: a sink can sit queued in
         # brain.py's _ask_queue for a while before its turn starts,
         # and the tab it belongs to may have long since closed by
@@ -280,3 +338,42 @@ class BrowserBridge:
         _sink.reply_done = _reply_done
         _sink.stop = _stop
         return _sink
+
+
+class ListenStream:
+    """One tab's hands-free audio as a mic-shaped stream for
+    ears.Ears.listen_once(stream=...): read(n) blocks for n samples at
+    RATE, resampling whatever rate the browser actually captures at.
+    A gap in the audio (network stall) reads as silence after 100ms,
+    so the caller's abort check keeps getting a turn."""
+
+    def __init__(self, conn: Conn):
+        self.conn = conn
+        self._buf = np.zeros(0, dtype=np.int16)
+        self._state = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n: int):
+        while len(self._buf) < n:
+            try:
+                chunk = self.conn._listen_q.get(timeout=0.1)
+            except queue.Empty:
+                if len(self._buf) == 0:
+                    return np.zeros((n, 1), dtype=np.int16), False
+                continue
+            if len(chunk) < 4:
+                continue
+            rate = struct.unpack_from("<I", chunk, 0)[0]
+            pcm = chunk[4:]
+            if rate != RATE and rate > 0:
+                pcm, self._state = audioop.ratecv(pcm, 2, 1, rate, RATE,
+                                                  self._state)
+            self._buf = np.concatenate(
+                [self._buf, np.frombuffer(pcm, dtype=np.int16)])
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out.reshape(-1, 1), False

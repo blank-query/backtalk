@@ -25,8 +25,8 @@ over a hidden warmup query so the first real turn is already hot.
 Typing in this terminal is a first-class turn too: same conversation,
 spoken reply, and typing while it talks interrupts it.
 
-THE VOICE CONSOLE: exact phrases, spoken (or typed) alone, control the
-session itself so you never go back to the keyboard: "clear the
+THE VOICE CONSOLE: exact phrases, spoken (or typed) alone and led by
+the agent's name ("Jarvis, clear the session"), control the session itself so you never go back to the keyboard: "clear the
 session" / "compact the session" / "switch to the deep model" / "back
 to the fast model" / "set effort to low" (or medium, high, max) /
 "usage report" / "go hands free" and "push to talk mode" (the MIC) /
@@ -60,6 +60,7 @@ import re
 import socket
 import sys
 import threading
+from difflib import SequenceMatcher
 import time
 
 from backtalk import signals
@@ -70,7 +71,7 @@ from backtalk.ears import (Ears, explain_audio_failure, record_held,
 from backtalk.mouth import Mouth
 from backtalk.ptt import PTTListener
 from backtalk.vlog import log
-from backtalk.web import BrowserBridge
+from backtalk.web import BrowserBridge, ListenStream
 
 NAME = CFG["name"]
 QUIT_PHRASES = CFG["quit_phrases"]
@@ -319,11 +320,14 @@ CONSOLE_VERBS = {
     "fast":      ("switch to the fast model", "use the fast model",
                   "back to the fast model", "slash model fast"),
     "usage":     ("usage report", "slash usage"),
-    "micopen":   ("go hands free", "hands free mode",
+    "micopen":   ("go hands free", "hands free mode", "start listening",
+                  "wake up", "listen up", "resume listening", "i m back",
+                  "unmute",
                   "hands free listening", "open mic", "open the mic"),
     "micptt":    ("push to talk", "push to talk mode",
                   "back to push to talk", "back to the button"),
-    "micmute":   ("stop listening", "mute yourself", "mute the mic"),
+    "micmute":   ("stop listening", "mute yourself", "mute the mic", "mute",
+                  "pause", "paused", "stand by", "standby", "go to sleep"),
     "noask":     ("stop asking for permission",
                   "stop asking permission",
                   "stop asking me for permission",
@@ -342,7 +346,14 @@ _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
 def console_match(text):
-    norm = " ".join(text.lower().replace("-", " ").split()).strip(" .,!?")
+    """A console phrase must open with the agent's name ("Jarvis, stop
+    listening"), so everyday speech near an open mic can't flip a
+    setting. Close mishearings of the name count ("Javi")."""
+    words, name = _norm_speech(text).split(), NAME.lower().split()
+    head = " ".join(words[:len(name)])
+    if not words or SequenceMatcher(None, head, " ".join(name)).ratio() < 0.75:
+        return None
+    norm = " ".join(words[len(name):])
     for verb, phrases in CONSOLE_VERBS.items():
         if norm in phrases:
             return verb
@@ -351,6 +362,20 @@ def console_match(text):
                     f"slash effort {lvl}"):
             return f"effort:{lvl}"
     return None
+
+
+def trailing_mic_verb(text):
+    """A listening command may also END a longer utterance, as its own
+    sentence: "That worked. Jarvis, pause." -> ("micmute", "That
+    worked."). Mic verbs only; the heavier ones (clear, compact...)
+    still have to be said alone. Whisper's sentence break is what
+    keeps "add Jarvis mute and Jarvis unmute" from firing: no full
+    stop before the name, no command."""
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    verb = console_match(parts[-1]) if len(parts) > 1 else None
+    if verb in ("micopen", "micptt", "micmute"):
+        return verb, " ".join(parts[:-1])
+    return None, text
 
 
 def _write_config_key(key, value):
@@ -667,33 +692,41 @@ async def amain():
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
     typed_fut: asyncio.Future | None = None
 
-    async def run_console(verb):
+    async def run_console(verb, sink=None):
         """One voice-console verb. The current reply was already
         cancelled and awaited by handle(); the pipe gets drained here
         before the command goes out. A verb that blows up must never
-        take the whole voice session down with it."""
+        take the whole voice session down with it. `sink` is the
+        asking browser's, when a browser asked: the spoken answer goes
+        back there, and the mic verbs act on that browser alone."""
         try:
-            await _run_console_inner(verb)
+            await _run_console_inner(verb, sink)
         except Exception as e:
             log(f"[console] {verb} failed: {e}")
-            mouth.say("That command hit an error. Check the log.")
+            mouth.say("That command hit an error. Check the log.",
+                      remote_sink=sink)
             signals.set_state("idle")
 
-    async def _run_console_inner(verb):
+    async def _run_console_inner(verb, sink):
         _deny_pending()
+        conn = getattr(sink, "conn", None)
+
+
+        def say(text):   # every line below answers whoever asked
+            mouth.say(text, remote_sink=sink)
         say_after = None
         if verb == "clear":
             resp = await brain.command("/clear")
             brain.clear_tasks()
             say_after = "Cleared. Fresh slate."
         elif verb == "compact":
-            mouth.say("Compacting. One moment.")
+            say("Compacting. One moment.")
             resp = await brain.command("/compact")
             say_after = "Compacted. Same conversation, smaller footprint."
         elif verb == "deep":
-            mouth.say("Switching to the deep model. Heads up, replies "
-                      "get slower. Say back to the fast model when "
-                      "you're done.")
+            say("Switching to the deep model. Heads up, replies "
+                f"get slower. Say {NAME}, back to the fast model when "
+                "you're done.")
             resp = await brain.command(f"/model {CFG['deep_model']}")
             say_after = "Deep model online, for this session only."
         elif verb == "fast":
@@ -710,27 +743,47 @@ async def amain():
                          "stick past a restart.")
         elif verb == "usage":
             resp = ""
-            mouth.say(_spoken_usage(brain.session,
-                                    await brain.context_usage()))
+            say(_spoken_usage(brain.session,
+                              await brain.context_usage()))
+        elif verb in ("micopen", "micptt", "micmute") and conn is not None:
+            resp = ""
+            if verb == "micopen" and conn.listening and not conn.listen_muted:
+                say("Already listening on this device.")
+            elif verb == "micopen":
+                bridge.set_listening(conn, True)
+                say(f"Hands-free on for this device. Say {NAME}, stop "
+                    f"listening to pause me, or {NAME}, push to talk "
+                    "mode to turn it off.")
+            elif not conn.listening:
+                say("This device is already on push to talk.")
+            elif verb == "micmute" and conn.listen_muted:
+                say("Already paused.")
+            elif verb == "micmute":
+                bridge.set_listening(conn, True, muted=True)
+                say(f"Paused. Say {NAME}, start listening, or tap me, "
+                    "to bring me back.")
+            else:
+                bridge.set_listening(conn, False)
+                say("Push to talk. Tap and hold me to talk.")
         elif verb == "micopen":
             resp = ""
             if _MIC["mode"] == "open":
-                mouth.say("Already in hands-free listening.")
+                say("Already in hands-free listening.")
             else:
                 _MIC["mode"] = "open"
                 _MIC["muted"] = False
                 _MIC["gen"] += 1
                 _write_config_key("mic_mode", "open")
                 log("[console] mic_mode -> open (hands-free listening)")
-                mouth.say("Hands-free listening on. I'm always "
-                          "listening now, so anything said in the room "
-                          "can reach me. The talk key still works, and "
-                          "holding it always gets you heard. Say push "
-                          "to talk mode to bring the button back.")
+                say("Hands-free listening on. I'm always "
+                    "listening now, so anything said in the room "
+                    "can reach me. The talk key still works, and "
+                    f"holding it always gets you heard. Say {NAME}, "
+                    "push to talk mode to bring the button back.")
         elif verb == "micptt":
             resp = ""
             if _MIC["mode"] == "ptt" and not _MIC["muted"]:
-                mouth.say("Already on push to talk.")
+                say("Already on push to talk.")
             else:
                 _MIC["mode"] = "ptt"
                 _MIC["muted"] = False
@@ -738,26 +791,26 @@ async def amain():
                 _write_config_key("mic_mode", "ptt")
                 log("[console] mic_mode -> ptt")
                 key = str(CFG.get("ptt_key", "home")).replace("_", " ")
-                mouth.say(f"Push to talk. Hold the {key} key and "
-                          "talk; the mic stays closed otherwise.")
+                say(f"Push to talk. Hold the {key} key and "
+                    "talk; the mic stays closed otherwise.")
         elif verb == "micmute":
             resp = ""
             if _MIC["mode"] != "open":
-                mouth.say("The open mic is already off; I only hear "
-                          "the talk key.")
+                say("The open mic is already off; I only hear "
+                    "the talk key.")
             else:
                 # Not persisted: a restart comes back hands-free.
                 _MIC.update(muted=True, mode="ptt", gen=_MIC["gen"] + 1)
                 log("[console] open mic muted until the next talk-key press")
-                mouth.say("Not listening. Press the talk key when you "
-                          "want me back.")
+                say("Not listening. Press the talk key when you "
+                    "want me back.")
         elif verb == "noask":
             resp = ""
             _CONFIRM["verb"] = "noask"
             _CONFIRM["at"] = time.monotonic()
-            mouth.say("Auto-approve means I act without asking "
-                      "permission, and it becomes your saved default. "
-                      "Say confirm to switch.")
+            say("Auto-approve means I act without asking "
+                "permission, and it becomes your saved default. "
+                "Say confirm to switch.")
         elif verb == "noask:confirmed":
             resp = ""
             saved = _write_config_key("permission_mode",
@@ -765,13 +818,13 @@ async def amain():
             _AUTOAPPROVE["on"] = True
             log("[console] permission_mode -> bypassPermissions"
                 + (" (saved)" if saved else " (session only)"))
-            mouth.say(("Auto-approve on, and saved as your default. "
-                       if saved else
-                       "Auto-approve on for this session. The config "
-                       "file couldn't be written, so it won't stick "
-                       "past a restart. ")
-                      + "Say start asking again any time to flip it "
-                        "back.")
+            say(("Auto-approve on, and saved as your default. "
+                 if saved else
+                 "Auto-approve on for this session. The config "
+                 "file couldn't be written, so it won't stick "
+                 "past a restart. ")
+                + f"Say {NAME}, start asking again any time to flip it "
+                  "back.")
         elif verb == "ask":
             resp = ""
             saved = _write_config_key("permission_mode", "ask")
@@ -790,16 +843,16 @@ async def amain():
             log("[console] permission_mode -> ask"
                 + (" (saved)" if saved else " (session only)"))
             if flipped:
-                mouth.say("Done. I'll ask out loud before real "
-                          "actions"
-                          + (", and that's saved as your default."
-                             if saved else
-                             ". The config file couldn't be written, "
-                             "so tell me again after a restart."))
+                say("Done. I'll ask out loud before real "
+                    "actions"
+                    + (", and that's saved as your default."
+                       if saved else
+                       ". The config file couldn't be written, "
+                       "so tell me again after a restart."))
             else:
-                mouth.say("I saved asking as your default, but this "
-                          "session couldn't switch over. Restart the "
-                          "voice line to get asking back.")
+                say("I saved asking as your default, but this "
+                    "session couldn't switch over. Restart the "
+                    "voice line to get asking back.")
         else:
             resp = ""
         if say_after:
@@ -807,10 +860,10 @@ async def amain():
             # (confirmations, API errors); an error outranks our line
             low = (resp or "").lower()
             if resp and ("error" in low or "invalid" in low):
-                mouth.say(resp[:160])
+                say(resp[:160])
                 log(f"[console] {verb} answered: {resp[:120]}")
             else:
-                mouth.say(say_after)
+                say(say_after)
         signals.set_state("idle")
 
     async def handle(text: str, spoke_from: float | None = None,
@@ -884,8 +937,11 @@ async def amain():
                 brain.remote_sink.stop()
         verb = verb or console_match(text)
         if verb:
-            await run_console(verb)
+            await run_console(verb, remote_sink)
             return True
+        tail_verb, text = trailing_mic_verb(text)
+        if tail_verb:
+            await run_console(tail_verb, remote_sink)
         signals.set_state("thinking")
         signals.static_start()
         _deny_pending()
@@ -916,8 +972,44 @@ async def amain():
         # turns nobody specific asked for (background reports).
         bridge: BrowserBridge | None = None
 
+        # Browser hands-free: one listener thread per listening tab,
+        # the same Ears endpointing and filters as the local open mic,
+        # fed from that tab's stream. Utterances land in hf_q.
+        hf_q: "asyncio.Queue" = asyncio.Queue()
+        hf_fut: asyncio.Future | None = None
+
+        def _hf_listen(conn):
+            t = getattr(conn, "hf_thread", None)
+            if t is not None and t.is_alive():
+                return
+            stream, hf_ears = ListenStream(conn), Ears(
+                silence_ms=int(CFG.get("open_mic_silence_ms") or 480))
+            # Same rule as the local open mic: closed during this tab's
+            # own press, for the whole turn, and while the mouth still
+            # speaks (the turn ends before the audio does). The tab
+            # itself also stops sending while it plays the reply (see
+            # core.js); echo cancellation alone didn't keep it out.
+            gate = lambda: (conn.recording or brain.turn_active
+                            or mouth.speaking)
+            stop = lambda: not conn.listening or conn.disconnected
+
+            def work():
+                while not stop():
+                    try:
+                        text = hf_ears.listen_once(stream=stream, gate=gate,
+                                                   abort=stop)
+                    except Exception as e:
+                        log(f"[web] hands-free listener failed: {e!r}")
+                        return
+                    if text and not stop():
+                        loop.call_soon_threadsafe(hf_q.put_nowait,
+                                                  (conn, text))
+            conn.hf_thread = threading.Thread(target=work, daemon=True)
+            conn.hf_thread.start()
+
         if CFG.get("web", {}).get("enabled"):
             bridge = BrowserBridge(CFG["web"])
+            bridge.on_listen = _hf_listen
             brain.remote_sink = bridge.make_broadcast_sink()
             asyncio.create_task(bridge.serve())
         ptt = PTTListener(CFG["ptt_key"])
@@ -986,9 +1078,33 @@ async def amain():
             if bridge is not None:
                 if ws_press_fut is None:
                     ws_press_fut = asyncio.ensure_future(bridge.wait_press())
-                waiters.add(ws_press_fut)
+                if hf_fut is None:
+                    hf_fut = asyncio.ensure_future(hf_q.get())
+                waiters |= {ws_press_fut, hf_fut}
             done, _ = await asyncio.wait(
                 waiters, return_when=asyncio.FIRST_COMPLETED)
+            if hf_fut is not None and hf_fut in done:
+                conn, text = hf_fut.result(); hf_fut = None
+                if conn.disconnected or not conn.listening:
+                    continue
+                if conn.listen_muted:
+                    # Paused: only "(name,) start listening" or "go
+                    # hands free" gets through; the room is heard, never
+                    # acted on.
+                    if "micopen" in (console_match(text),
+                                     trailing_mic_verb(text)[0]):
+                        bridge.set_listening(conn, True)
+                        mouth.say("Listening.",
+                                  remote_sink=bridge.make_sink(conn))
+                    else:
+                        log(f"[web] paused, ignored: {text[:60]!r}")
+                    continue
+                if any(q in text.lower() for q in QUIT_PHRASES):
+                    log("[web] quit phrase heard hands-free, ignored")
+                    continue
+                await handle(text, spoke_from=time.monotonic(),
+                             remote_sink=bridge.make_sink(conn))
+                continue
             if typed_fut in done:
                 text = typed_fut.result(); typed_fut = None
                 if text and not await handle(text):

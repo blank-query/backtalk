@@ -354,12 +354,15 @@ class Ears:
         self.silence_frames = silence_ms // FRAME_MS
 
     def listen_once(self, gate=None, timeout_s: float | None = None,
-                    abort=None) -> str | None:
+                    abort=None, stream=None) -> str | None:
         """Block until one utterance completes; return transcript
         (or None on timeout). An `abort` callable is checked every
         frame; returning True closes the mic and returns None, which
         is how a live switch back to push-to-talk shuts the open mic
-        down promptly instead of after one more utterance."""
+        down promptly instead of after one more utterance. `stream`
+        replaces the local mic with anything that has the same
+        context-manager read(n) -> (int16 (n, 1), overflowed) shape:
+        a browser's hands-free stream (web.ListenStream)."""
         frames: list[np.ndarray] = []
         ring: list[np.ndarray] = []   # pre-roll so the first syllable survives
         speech_run = 0
@@ -368,7 +371,7 @@ class Ears:
         in_utterance = False
         elapsed = 0.0
 
-        with _open_mic() as stream:
+        with (stream or _open_mic()) as stream:
             while True:
                 block, _ = stream.read(FRAME_LEN)
                 elapsed += FRAME_MS / 1000
