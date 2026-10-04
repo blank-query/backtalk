@@ -321,7 +321,8 @@ CONSOLE_VERBS = {
                   "back to the fast model", "slash model fast"),
     "usage":     ("usage report", "slash usage"),
     "micopen":   ("go hands free", "hands free mode", "start listening",
-                  "wake up", "listen up", "resume listening", "i m back",
+                  "wake up", "week up", "weak up",  # how whisper hears it
+                  "listen up", "resume listening", "i m back",
                   "unmute",
                   "hands free listening", "open mic", "open the mic"),
     "micptt":    ("push to talk", "push to talk mode",
@@ -1006,6 +1007,23 @@ async def amain():
             conn.hf_thread = threading.Thread(target=work, daemon=True)
             conn.hf_thread.start()
 
+        async def _publish_mic_mode():
+            """One word for a glance-at-it display (signals.set_mic_mode):
+            paused beats hands-free beats push-to-talk, across the local
+            mic and every connected tab. Polled: modes change rarely and
+            from several places."""
+            last = None
+            while True:
+                conns = list(bridge._conns) if bridge is not None else []
+                mode = ("paused" if _MIC["muted"] or any(c.listen_muted for c in conns)
+                        else "open" if _MIC["mode"] == "open" or any(c.listening for c in conns)
+                        else "ptt")
+                if mode != last:
+                    signals.set_mic_mode(mode)
+                    last = mode
+                await asyncio.sleep(0.5)
+
+        asyncio.create_task(_publish_mic_mode())
         if CFG.get("web", {}).get("enabled"):
             bridge = BrowserBridge(CFG["web"])
             bridge.on_listen = _hf_listen
