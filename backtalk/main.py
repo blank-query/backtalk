@@ -930,9 +930,13 @@ async def amain():
             _MIC["btn"] = True
         # The open mic yields while the BUTTON records (or the double
         # capture would turn one held utterance into two turns), and,
-        # without barge-in, while the mouth speaks.
+        # without barge-in, for the whole turn: while the brain works
+        # as well as while the mouth speaks. The face's thinking sound
+        # plays through the same speakers during the working phase,
+        # and an open mic listening then transcribed it as nonsense
+        # ("9, 9, 9...") and interrupted the reply.
         mic_gate = (lambda: _MIC["btn"]
-                    or (not barge_in and mouth.speaking))
+                    or (not barge_in and (mouth.speaking or brain.turn_active)))
         mic_fails = 0
         while True:
             if _MIC["gen"] != mic_gen_seen:
