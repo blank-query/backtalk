@@ -342,8 +342,13 @@ def transcribe(pcm: np.ndarray, vad: bool = False) -> str:
                                       temperature=0.0, language=lang,
                                       verbose=None)["text"].strip()
     else:
-        segments, _ = model.transcribe(audio, temperature=0.0, language=lang,
-                                       vad_filter=vad)
+        # Loops ("Okay. Okay. Okay..." x25, open mic on the Pi): a
+        # repetitive result gets re-decoded at a higher temperature
+        # (whisper's compression-ratio fallback, which a lone 0.0 turned
+        # off), and no window is conditioned on the last one's words.
+        segments, _ = model.transcribe(audio, language=lang, vad_filter=vad,
+                                       temperature=(0.0, 0.2, 0.4, 0.6),
+                                       condition_on_previous_text=False)
         text = "".join(s.text for s in segments).strip()
     return _NONSPEECH.sub("", text).strip()
 
