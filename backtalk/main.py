@@ -984,13 +984,12 @@ async def amain():
                 return
             stream, hf_ears = ListenStream(conn), Ears(
                 silence_ms=int(CFG.get("open_mic_silence_ms") or 480))
-            # Same rule as the local open mic: closed during this tab's
-            # own press, for the whole turn, and while the mouth still
-            # speaks (the turn ends before the audio does). The tab
-            # itself also stops sending while it plays the reply (see
-            # core.js); echo cancellation alone didn't keep it out.
-            gate = lambda: (conn.recording or brain.turn_active
-                            or mouth.speaking)
+            # Closed only during this tab's own press. The tab itself
+            # goes deaf while it plays the reply or the thinking sound
+            # (core.js), which is what actually reaches its mic; gating
+            # on the turn here also deafened every OTHER device while
+            # one was being answered. Speech mid-turn queues (below).
+            gate = lambda: conn.recording
             stop = lambda: not conn.listening or conn.disconnected
 
             def work():
@@ -1102,7 +1101,11 @@ async def amain():
                 if any(q in text.lower() for q in QUIT_PHRASES):
                     log("[web] quit phrase heard hands-free, ignored")
                     continue
+                # interrupt=False: an open mic queues behind a reply in
+                # progress rather than cutting it off; the Interrupt
+                # button is the way to stop one.
                 await handle(text, spoke_from=time.monotonic(),
+                             interrupt=False,
                              remote_sink=bridge.make_sink(conn))
                 continue
             if typed_fut in done:
