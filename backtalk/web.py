@@ -27,6 +27,14 @@ press as another input source feeding the SAME turn-handling path, not
 a parallel reimplementation of it.
 
 Wire protocol, deliberately tiny:
+  text frame  {"type": "hello", "device_id": ...}  browser -> server,
+                                             first message, sent right
+                                             after connecting: the
+                                             browser's own persistent
+                                             token (see core.js's
+                                             DEVICE_ID), used for
+                                             Conn.id and per-device
+                                             routing.
   text frame  {"type": "press"}             browser -> server (queue)
   text frame  {"type": "interrupt_press"}   browser -> server (the
                                              Interrupt button: stop the
@@ -68,7 +76,14 @@ class Conn:
     def __init__(self, ws, bridge: "BrowserBridge"):
         self.ws = ws
         self.bridge = bridge
+        # Set from the client's own "hello" (a random token the browser
+        # generates once and keeps in sessionStorage, see core.js's
+        # DEVICE_ID), not assigned here. A server-assigned counter
+        # resets on every reconnect, silently reassigning the tab
+        # mid-session; the client's token survives reloads and drops.
+        self.id = None
         self.disconnected = False
+        self.recording = False   # this tab's own slot, not bridge-wide
         self._frames: "asyncio.Queue" = asyncio.Queue()
         self._released = asyncio.Event()
 
@@ -84,7 +99,9 @@ class Conn:
                 except ValueError:
                     continue
                 kind = data.get("type")
-                if kind == "press":
+                if kind == "hello":
+                    self.id = data.get("device_id") or self.id
+                elif kind == "press":
                     self.bridge._on_press(self, interrupt=False)
                 elif kind == "interrupt_press":
                     self.bridge._on_press(self, interrupt=True)
@@ -99,25 +116,18 @@ class Conn:
 
 
 class BrowserBridge:
-    """websockets.serve() wrapper. Exactly one connection may be
-    "active" (mid-press) at a time — a second tab's press while one is
-    in flight is logged and ignored, rather than tracked with a bare
-    boolean, so growing this into a small per-connection table later
-    (real multi-client support) is a small diff, not a rewrite. That
-    is explicitly NOT being built now."""
+    """websockets.serve() wrapper. Every connected tab gets its own
+    capture slot (Conn.recording), so N tabs can each record
+    independently: the guard in _on_press is per-connection, not
+    bridge-wide. _conns tracks every live connection so a sink can
+    broadcast to all of them (see make_broadcast_sink)."""
 
-    def __init__(self, cfg: dict, on_connect=None, on_disconnect=None):
+    def __init__(self, cfg: dict):
         self._cfg = cfg
         self._server = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._press_q: "asyncio.Queue[tuple[Conn, bool]]" = asyncio.Queue()
-        self._active: Conn | None = None
-        # Connection-lifecycle hooks, not press-lifecycle: main.py uses
-        # these to route EVERY turn's audio to a connected browser
-        # (see main.py's amain), not just turns that tab itself asked
-        # for — a tab can be listening without ever pressing anything.
-        self._on_connect = on_connect
-        self._on_disconnect = on_disconnect
+        self._conns: set[Conn] = set()
 
     async def serve(self):
         self._loop = asyncio.get_running_loop()
@@ -126,13 +136,11 @@ class BrowserBridge:
 
         async def handler(ws):
             conn = Conn(ws, self)
-            if self._on_connect:
-                self._on_connect(conn)
+            self._conns.add(conn)
             try:
                 await conn.reader()   # runs until this connection closes
             finally:
-                if self._on_disconnect:
-                    self._on_disconnect(conn)
+                self._conns.discard(conn)
 
         self._server = await websockets.serve(handler, host, port)
         log(f"[web] browser bridge listening on ws://{host}:{port}")
@@ -143,13 +151,14 @@ class BrowserBridge:
         the event loop — no thread hop needed here. `interrupt` is the
         Interrupt button (stop the current turn, then record) versus a
         plain tap (queue behind it, touch nothing). This guard is about
-        overlapping RECORDINGS on one connection, not overlapping
-        turns — a press queues fine the instant the PREVIOUS press's
-        recording ends, long before that turn's reply is spoken."""
-        if self._active is not None and not self._active.disconnected:
-            log("[web] press ignored — another browser recording is live")
+        overlapping RECORDINGS on ONE connection, not overlapping
+        turns or other tabs; a press queues fine the instant THIS
+        tab's previous recording ends, and a different tab's press is
+        never affected by it at all."""
+        if conn.recording:
+            log("[web] press ignored, this tab is already recording")
             return
-        self._active = conn
+        conn.recording = True
         conn._released.clear()
         while not conn._frames.empty():
             conn._frames.get_nowait()   # drop anything stale from before this press
@@ -169,6 +178,13 @@ class BrowserBridge:
         (defense against browser/engine quirks) via stdlib audioop —
         no new dependency. Returns None on no audio at all."""
         frames: list[np.ndarray] = []
+        # audioop.ratecv's filter memory, carried across chunks. Passing
+        # None on every chunk instead of this would reset the resample
+        # filter at each chunk boundary, glitching audio once per chunk
+        # whenever the browser's actual mic rate isn't exactly 16000
+        # (common: many browsers ignore the AudioContext sampleRate
+        # request).
+        resample_state = None
         try:
             while True:
                 if abort and abort():
@@ -186,12 +202,11 @@ class BrowserBridge:
                 rate = struct.unpack_from("<I", chunk, 0)[0]
                 pcm_bytes = chunk[4:]
                 if rate != RATE and rate > 0:
-                    pcm_bytes, _ = audioop.ratecv(
-                        pcm_bytes, 2, 1, rate, RATE, None)
+                    pcm_bytes, resample_state = audioop.ratecv(
+                        pcm_bytes, 2, 1, rate, RATE, resample_state)
                 frames.append(np.frombuffer(pcm_bytes, dtype=np.int16))
         finally:
-            if self._active is conn:
-                self._active = None
+            conn.recording = False
         if not frames:
             return None
         return np.concatenate(frames)
@@ -232,6 +247,35 @@ class BrowserBridge:
                     conn.ws.send(json.dumps({"type": "stop"})), loop)
             except Exception:
                 pass
+
+        _sink.reply_done = _reply_done
+        _sink.stop = _stop
+        _sink.conn_id = conn.id
+        # Live lookup, not a snapshot: a sink can sit queued in
+        # brain.py's _ask_queue for a while before its turn starts,
+        # and the tab it belongs to may have long since closed by
+        # then; see is_live's use there.
+        _sink.is_live = lambda: not conn.disconnected
+        return _sink
+
+    def make_broadcast_sink(self):
+        """A (rate, pcm) -> None closure for turns nobody specific
+        asked for (background reports) or where there's no one
+        connection to prefer: sends to every tab connected AT SEND
+        TIME, built fresh from self._conns each call so a tab
+        connecting or disconnecting mid-reply needs no bookkeeping
+        here."""
+        def _sink(rate: int, pcm: np.ndarray):
+            for conn in list(self._conns):
+                self.make_sink(conn)(rate, pcm)
+
+        def _reply_done():
+            for conn in list(self._conns):
+                self.make_sink(conn).reply_done()
+
+        def _stop():
+            for conn in list(self._conns):
+                self.make_sink(conn).stop()
 
         _sink.reply_done = _reply_done
         _sink.stop = _stop

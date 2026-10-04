@@ -45,6 +45,7 @@ import asyncio
 import os
 import re
 import warnings
+from collections import deque
 from datetime import datetime
 
 from claude_agent_sdk import (
@@ -87,13 +88,22 @@ class WarmBrain:
         # The mouth the reader speaks every turn through. Set once at
         # construction; main.py owns the Mouth instance's lifetime.
         self.mouth = mouth
-        # While a browser client is connected, every turn — not just
-        # ones that client asked for — is ALSO sent its way (the
-        # simplest correct answer to "whose turn is this" once turns
-        # aren't paired to queries at all: Jarvis's future is all
-        # remote, so once a browser is listening, it hears everything).
-        # main.py/web.py set this on connect, clear it on disconnect.
+        # Fallback sink for a turn nobody specific asked for (a
+        # background report); main.py sets this once to a broadcast
+        # sink reaching every connected browser. A turn that WAS asked
+        # by a specific connection routes to that connection instead,
+        # via _current_asker below.
         self.remote_sink = None
+        # Utterances not yet sent to the SDK: (utterance, remote_sink)
+        # pairs, queued because a turn was already in flight when
+        # ask() was called. The session only ever has ONE query
+        # outstanding at a time (see _dispatch_next), so there is
+        # never more than one live asker to route a turn to: the
+        # asker is just whoever's query is actually running right
+        # now (_current_asker below), a direct reference, never a
+        # position guessed out of a queue.
+        self._ask_queue: deque = deque()
+        self._current_asker = None   # remote_sink owed the in-flight turn
         # Session usage, spoken on request ("usage report").
         self.session = {"turns": 0, "out_tokens": 0, "in_tokens": 0,
                         "cost": 0.0}
@@ -173,11 +183,30 @@ class WarmBrain:
         self._start_reader()
         self.clear_tasks()
 
+    def _dispatch_next(self):
+        """Send the next queued utterance, if the session is free.
+        Whoever's query this is becomes _current_asker directly, no
+        popping-and-hoping at the other end when the turn's content
+        shows up later. The asker's tab is stamped HERE, not at first
+        content: the model can think for seconds before any text
+        streams, and a face polling during that gap would otherwise
+        show the working ring on whichever tab asked last. While a
+        reply's audio is actually playing, mouth.py's playing-tab
+        marker overrides this one (see signals.set_playing_conn)."""
+        if self._turn_active or not self._ask_queue:
+            return
+        utterance, remote_sink = self._ask_queue.popleft()
+        self._turn_active = True
+        self._current_asker = remote_sink
+        signals.set_active_conn(getattr(remote_sink, "conn_id", None))
+        asyncio.ensure_future(self._client.query(utterance))
+
     def clear_tasks(self):
         """Reset the active-task set to empty (fresh launch, or the
         session itself was cleared/reset underneath it)."""
         self._active_tasks.clear()
         signals.set_tasks(0)
+        signals.set_active_conn(None)
 
     def _start_reader(self):
         self._reader_task = asyncio.ensure_future(self._read_forever())
@@ -284,18 +313,25 @@ class WarmBrain:
         except Exception:
             pass
 
-    def ask(self, utterance: str):
-        """Send an utterance. SENDING IS JUST SENDING: this does not
+    def ask(self, utterance: str, remote_sink=None):
+        """Queue an utterance. SENDING IS JUST SENDING: this does not
         wait for or return the reply — the reader speaks it, whoever's
         turn it turns out to be. Equivalent for the caller's purposes
         to firing a query and walking away.
 
-        turn_active flips True HERE, synchronously, not when the
-        reader first sees content — a press landing in the gap between
-        sending and the model's first token must still find a turn to
-        interrupt, or it slips through uninterrupted."""
-        self._turn_active = True
-        return asyncio.ensure_future(self._client.query(utterance))
+        `remote_sink`, when given, names the SPECIFIC connection that
+        asked. Omit it (the local key's case) and the turn falls back
+        to whatever self.remote_sink is set to.
+
+        If nothing else is in flight, this dispatches immediately and
+        turn_active flips True synchronously, before returning: a
+        press landing in the gap between sending and the model's
+        first token must still find a turn to interrupt. If a turn IS
+        already running, this just queues: the session never has two
+        queries outstanding at once, so there's never ambiguity about
+        which asker a turn belongs to later."""
+        self._ask_queue.append((utterance, remote_sink))
+        self._dispatch_next()
 
     async def capture(self, text: str, count_turn: bool = True) -> str:
         """Send `text` and wait for the FULL text reply, un-spoken —
@@ -368,17 +404,17 @@ class WarmBrain:
         batch: list[str] = []
         pending: list[str] = []
         buf = ""
+        turn_sink = None   # resolved at this turn's first content, below
 
         def flush():
             nonlocal batch, pending
             if batch and self.mouth:
-                self.mouth.say_chunk(" ".join(batch), pending,
-                                     self.remote_sink)
+                self.mouth.say_chunk(" ".join(batch), pending, turn_sink)
                 pending = []
                 batch = []
 
         def emit(raw: str):
-            nonlocal first, batch, pending
+            nonlocal first, batch, pending, turn_sink
             found = _DIRECTION_TAG.findall(raw)
             if found:
                 pending += [d.strip() for d in found if d.strip()]
@@ -387,9 +423,19 @@ class WarmBrain:
             if not s or not self.mouth:
                 return
             if first:
+                # _current_asker is the exact remote_sink whose ask()
+                # caused the query now running: a direct reference,
+                # set at dispatch, not inferred from queue order. Only
+                # check liveness here: the tab may have closed in the
+                # time between being queued and this turn starting.
+                turn_sink = self._current_asker
+                if turn_sink is not None and hasattr(turn_sink, "is_live") \
+                        and not turn_sink.is_live():
+                    turn_sink = None
+                turn_sink = turn_sink or self.remote_sink
                 log(f"[Jarvis] {s}"
                     + (f"  <directions: {pending}>" if pending else ""))
-                self.mouth.say_chunk(s, pending, self.remote_sink)
+                self.mouth.say_chunk(s, pending, turn_sink)
                 pending = []
                 first = False
             else:
@@ -495,6 +541,13 @@ class WarmBrain:
                     was_discarding = self._discard_until_result
                     self._discard_until_result = False
                     self._turn_active = False
+                    # This turn is over: nobody's question is in flight
+                    # until the next dispatch stamps one. Clearing here
+                    # (before any next dispatch) means an UNPROMPTED turn
+                    # (background report) animates every tab, matching
+                    # its broadcast audio. A reply still playing keeps its
+                    # tab via mouth's playing stamp, which wins.
+                    signals.set_active_conn(None)
                     if was_discarding:
                         buf = ""
                         first, batch, pending = True, [], []
@@ -502,11 +555,15 @@ class WarmBrain:
                         # did run and spend usage, it just wasn't spoken.
                         self._tally(msg)
                         self._remember_session(msg)
+                        self._current_asker = None
+                        self._dispatch_next()
                         continue
                     self._tally(msg)
                     self._remember_session(msg)
                     await self._pull_rate_limits()
                     end_turn()
+                    self._current_asker = None
+                    self._dispatch_next()
         finally:
             if not nxt.done():
                 nxt.cancel()
@@ -533,6 +590,13 @@ class WarmBrain:
             can_use_tool=self._can_use_tool, add_dirs=CFG["extra_dirs"],
             skills=CFG["visible_skills"], resume=None))
         await self._client.connect()
+        # The turn that broke is gone; whatever was "in flight" no
+        # longer is. Without this, a dead _turn_active=True would
+        # wedge _dispatch_next forever, and nothing queued after a
+        # rebuild would ever get sent.
+        self._turn_active = False
+        self._current_asker = None
+        self._dispatch_next()
         log("[brain] reader rebuilt the session after a stream error "
             "(conversation memory for this session resets)")
 

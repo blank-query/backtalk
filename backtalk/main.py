@@ -791,12 +791,15 @@ async def amain():
         signals.set_state("idle")
 
     async def handle(text: str, spoke_from: float | None = None,
-                     interrupt: bool = True) -> bool:
+                     interrupt: bool = True, remote_sink=None) -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
         told apart from speech that began before the ask even existed.
         interrupt=False is a QUEUED browser tap (Part 2): touch nothing
-        already playing, just line this one up behind it."""
+        already playing, just line this one up behind it. `remote_sink`,
+        when given (a browser press), tags THIS utterance with the
+        asking connection, so its reply routes back there instead of
+        broadcasting; see brain.py's ask()."""
         log(f"[you]    {text}")
         # A pending spoken permission ask owns the next utterance IF
         # that utterance started after the ask was posed. Speech that
@@ -863,7 +866,7 @@ async def amain():
         signals.set_state("thinking")
         signals.static_start()
         _deny_pending()
-        brain.ask(text)
+        brain.ask(text, remote_sink=remote_sink)
         return True
 
     try:
@@ -878,28 +881,21 @@ async def amain():
         # another press, feeding this SAME loop and the SAME handle()
         # path as the key — see web.py's docstring for why.
         #
-        # brain.remote_sink follows the CONNECTION, not the turn that
-        # was asked — once a browser tab is connected, every turn's
-        # audio goes to it too, whoever's turn it is (see the Backtalk
-        # Turn Stream Redesign note: with turns no longer paired to the
-        # query that may have started them, trying to route each one
-        # back to its original asker is exactly the kind of per-turn
-        # bookkeeping that caused the bug this redesign fixes).
+        # ONE SHARED CLAUDE CODE SESSION, every device. A separate
+        # WarmBrain per connection was tried and reverted: it meant a
+        # brand-new, memory-less session every time a tab reconnected,
+        # and it broke the voice-console commands (clear/compact/...),
+        # which only ever acted on one fixed brain regardless of which
+        # tab said them. Routing per device is handled below instead,
+        # by tagging each ask() with the asking connection's own sink
+        # (see brain.py's _current_asker), no separate session needed
+        # for that. brain.remote_sink stays the broadcast one, for
+        # turns nobody specific asked for (background reports).
         bridge: BrowserBridge | None = None
-        _ws_conn = {"current": None}
-
-        def _ws_connected(conn):
-            _ws_conn["current"] = conn
-            brain.remote_sink = bridge.make_sink(conn)
-
-        def _ws_disconnected(conn):
-            if _ws_conn["current"] is conn:
-                _ws_conn["current"] = None
-                brain.remote_sink = None
 
         if CFG.get("web", {}).get("enabled"):
-            bridge = BrowserBridge(CFG["web"], on_connect=_ws_connected,
-                                   on_disconnect=_ws_disconnected)
+            bridge = BrowserBridge(CFG["web"])
+            brain.remote_sink = bridge.make_broadcast_sink()
             asyncio.create_task(bridge.serve())
         ptt = PTTListener(CFG["ptt_key"])
         press_fut: asyncio.Future | None = None
@@ -1058,9 +1054,21 @@ async def amain():
                     # else: a queued tap that came up empty shouldn't
                     # stomp on whatever Jarvis is legitimately doing
                     continue
-                if not await handle(text, spoke_from=press_t,
-                                    interrupt=is_interrupt):
-                    return
+                if any(q in text.lower() for q in QUIT_PHRASES):
+                    # A quit phrase from a tab closes only that tab:
+                    # the brain is shared now, so running the normal
+                    # quit body (interrupt/signoff/stop) would hang up
+                    # every OTHER device's turn and speak the signoff
+                    # to every tab, not just this one.
+                    log("[web] quit phrase, closing this tab only")
+                    try:
+                        await conn.ws.close()
+                    except Exception:
+                        pass
+                    continue
+                await handle(text, spoke_from=press_t,
+                            interrupt=is_interrupt,
+                            remote_sink=bridge.make_sink(conn))
     except KeyboardInterrupt:
         pass
     finally:

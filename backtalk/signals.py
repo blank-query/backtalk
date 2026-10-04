@@ -38,6 +38,7 @@ Every write is wrapped: the bus must never crash the voice line.
 """
 import json
 import os
+import threading
 import subprocess
 import sys
 import time
@@ -54,6 +55,7 @@ _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 _TASKS_FILE = os.path.join(_DIR, ".voice_tasks")
+_ACTIVE_CONN_FILE = os.path.join(_DIR, ".voice_active_conn")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -95,6 +97,87 @@ def set_tasks(n: int):
         os.replace(tmp, _TASKS_FILE)
     except OSError:
         pass
+
+
+# The face animates only the tab a turn belongs to. Two facts feed that:
+#   - the tab whose QUESTION is in flight (stamped at dispatch, cleared at
+#     every turn end, so an unprompted turn means "everyone"), and
+#   - the tab whose AUDIO is playing right now (stamped as each chunk
+#     starts, cleared when playback goes quiet).
+# Audio wins while it plays (replies lag their text by seconds, so a newer
+# question can be in flight while an older reply still speaks); otherwise
+# the in-flight question decides. Mouth runs in its own thread; a lock
+# keeps the pair consistent.
+_conn_lock = threading.Lock()
+_turn_conn: str = ""
+_playing: bool = False
+_playing_conn: str = ""
+
+
+def _write_active_conn():
+    with _conn_lock:
+        val = _playing_conn if _playing else _turn_conn
+    try:
+        tmp = f"{_ACTIVE_CONN_FILE}.tmp{os.getpid()}"
+        with open(tmp, "w") as f:
+            f.write(val)
+        os.replace(tmp, _ACTIVE_CONN_FILE)
+    except OSError:
+        pass
+
+
+def set_active_conn(conn_id: str | None):
+    """The tab whose question is in flight ("" / None = nobody specific:
+    every tab). Stamped by brain at dispatch, cleared at each turn end.
+    Never raises."""
+    global _turn_conn
+    with _conn_lock:
+        _turn_conn = str(conn_id) if conn_id is not None else ""
+    _write_active_conn()
+
+
+# After playback stops, the face server still reports "speaking" while the
+# last waveform is fresh (ai-visualizer's WAVEFORM_STALE_S, 0.6 s) plus a
+# poll tick. Releasing the playing tab at once let that tail show as
+# "speaking, for everyone", flashing the Interrupt button on other tabs.
+# So the release is held a moment past that window.
+_PLAYING_RELEASE_S = 1.0
+_release_timer: "threading.Timer | None" = None
+
+
+def set_playing_conn(conn_id: str | None):
+    """Audio for this tab (None = broadcast: every tab) just started
+    playing. Wins over the in-flight question until clear_playing_conn()."""
+    global _playing, _playing_conn, _release_timer
+    with _conn_lock:
+        if _release_timer is not None:
+            _release_timer.cancel()
+            _release_timer = None
+        _playing = True
+        _playing_conn = str(conn_id) if conn_id is not None else ""
+    _write_active_conn()
+
+
+def clear_playing_conn():
+    """Playback went quiet: hand the face back to the in-flight question,
+    after _PLAYING_RELEASE_S (see above). New audio starting first cancels
+    the release."""
+    global _release_timer
+
+    def _release():
+        global _playing, _playing_conn, _release_timer
+        with _conn_lock:
+            _playing = False
+            _playing_conn = ""
+            _release_timer = None
+        _write_active_conn()
+
+    with _conn_lock:
+        if _release_timer is not None:
+            _release_timer.cancel()
+        _release_timer = threading.Timer(_PLAYING_RELEASE_S, _release)
+        _release_timer.daemon = True
+        _release_timer.start()
 
 
 def feed_waveform(pcm: np.ndarray):

@@ -474,6 +474,7 @@ class Mouth:
                     # the gap between two sentences of the same reply.
                     signals.reply_done()
                     self.ducker.speech_end()
+                    signals.clear_playing_conn()
                     signals.set_state("idle")
 
     def _get_out(self, rate: int) -> sd.OutputStream:
@@ -567,6 +568,12 @@ class Mouth:
             # AUDIO STARTS HERE: the head buffer is full and the first write
             # is next. Publishing now is what puts a screen cue on the spoken
             # word rather than seconds ahead of it.
+            # Also where the playing tab is marked, per chunk: replies lag
+            # their text by seconds, so a newer question can already be in
+            # flight while this one still speaks. The playing tab wins over
+            # the in-flight one for as long as audio is actually going out
+            # (see signals.set_playing_conn).
+            signals.set_playing_conn(getattr(remote_sink, "conn_id", None))
             if directions:
                 from backtalk import signals as _sig
                 _sig.direction(directions)
