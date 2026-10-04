@@ -360,6 +360,15 @@ def _stream_piper(text: str):
 
 
 def synth_stream(text: str, timeout: float = 30.0):
+    """_synth_raw with the configured gain_db applied to each chunk."""
+    g = 10 ** (float(CFG.get("gain_db") or 0) / 20)
+    for rate, pcm in _synth_raw(text, timeout):
+        if g != 1:
+            pcm = np.clip(pcm * g, -32768, 32767).astype(np.int16)
+        yield rate, pcm
+
+
+def _synth_raw(text: str, timeout: float = 30.0):
     """One sentence -> yields (sample_rate, pcm_chunk) as the TTS
     renders. ElevenLabs when configured, then Piper when configured
     (the fast local engine for weak hardware like a Pi), then Kokoro —

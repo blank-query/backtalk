@@ -44,6 +44,9 @@ OPEN_FRAMES = 4        # ~120ms speech to open an utterance
 MAX_UTTER_S = 30
 
 _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
+# Wails and grunts whisper spells out ("AHHH! AHHH!", "oh, oh, oh"):
+# a crying baby, not a request. Open mic only.
+_WAIL = re.compile(r"(a+h*|o+h*|a+w+|o+w+|u+gh*|u+h+|u+m+|h?m+|e+w+|(ha)+h?|hm+)")
 
 _model = None
 _model_lock = threading.Lock()
@@ -323,10 +326,13 @@ def warm():
     return _model
 
 
-def transcribe(pcm: np.ndarray) -> str:
+def transcribe(pcm: np.ndarray, vad: bool = False) -> str:
     """int16 mono 16kHz -> text. Bracketed non-speech markers that
     whisper emits ([BLANK_AUDIO], [SIGHS], (coughs)...) are stripped;
-    if nothing remains, it was silence."""
+    if nothing remains, it was silence. `vad` runs faster-whisper's
+    Silero filter first, for the open mic: webrtcvad lets rustling
+    and footsteps through, and whisper then invents words for them
+    ("1, 2, 3" from someone unloading groceries)."""
     model = warm()
     audio = pcm.astype(np.float32) / 32768.0
     lang = "en" if CFG["stt_model"].endswith(".en") else None
@@ -336,7 +342,8 @@ def transcribe(pcm: np.ndarray) -> str:
                                       temperature=0.0, language=lang,
                                       verbose=None)["text"].strip()
     else:
-        segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
+        segments, _ = model.transcribe(audio, temperature=0.0, language=lang,
+                                       vad_filter=vad)
         text = "".join(s.text for s in segments).strip()
     return _NONSPEECH.sub("", text).strip()
 
@@ -400,7 +407,12 @@ class Ears:
                             frames, ring = [], []
                             speech_run = speech_total = 0
                             continue
-                        return transcribe(np.concatenate(frames))
+                        text = transcribe(np.concatenate(frames), vad=True)
+                        words = re.findall(r"[a-z']+", text.lower())
+                        if words and all(_WAIL.fullmatch(w) for w in words):
+                            log(f"[ears] ignored a wail: {text[:40]!r}")
+                            return ""
+                        return text
 
 
 def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None:

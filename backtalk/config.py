@@ -107,6 +107,15 @@ DEFAULTS = {
     # (roughly 0.7 to 1.5). ElevenLabs pace lives in the master chain's
     # atempo instead. (Grew out of a community proposal, issue #1.)
     "speed": 1.0,
+    # Loudness boost for every spoken reply, in decibels (0 = as the
+    # engine renders it). Kokoro speaks well below typical video
+    # loudness; +6 roughly doubles perceived volume. Peaks past full
+    # scale are clipped, so keep it modest.
+    "gain_db": 0,
+    # Hands-free: how long a pause ends your sentence, in milliseconds.
+    # Too short and a mid-thought pause sends half a sentence; longer
+    # delays every reply by the difference.
+    "open_mic_silence_ms": 1200,
     # Resume the previous conversation on launch. OFF by default: a
     # fresh session every launch is the predictable behavior. Set true
     # and backtalk saves the session id after every completed turn
@@ -269,7 +278,8 @@ DISCIPLINE = (
     "you to change a voice-line setting: this session is controlled "
     "by exact spoken phrases, never by you. Permissions: 'stop "
     "asking for permission' (then 'confirm'), or 'start asking "
-    "again'. Microphone: 'go hands free', or 'push to talk mode'. "
+    "again'. Microphone: 'go hands free', or 'push to talk mode', "
+    "or 'stop listening' (pauses hands-free until the talk key). "
     "Also: 'clear the session', 'compact the session', 'switch to "
     "the deep model', 'back to the fast model', 'set effort to low' "
     "(or medium, high, max), and 'usage report'. You cannot flip "

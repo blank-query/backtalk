@@ -30,6 +30,7 @@ session itself so you never go back to the keyboard: "clear the
 session" / "compact the session" / "switch to the deep model" / "back
 to the fast model" / "set effort to low" (or medium, high, max) /
 "usage report" / "go hands free" and "push to talk mode" (the MIC) /
+"stop listening" (hands-free pauses until the next talk-key press) /
 "stop asking for permission" and "start asking again" (permissions,
 called auto-approve, a different axis than the microphone on purpose).
 And with permission_mode "ask" (the default), gated tool calls ASK OUT
@@ -104,7 +105,15 @@ _AUTOAPPROVE = {"on": False}
 # always gets you heard. gen bumps on every switch so an in-flight
 # open-mic capture from before the switch gets discarded, never
 # processed.
-_MIC = {"mode": "ptt", "gen": 0, "btn": False}
+_MIC = {"mode": "ptt", "gen": 0, "btn": False, "muted": False}
+
+
+def _unmute():
+    """After "stop listening", the next talk-key press (held or tapped)
+    brings hands-free back once its own capture is done."""
+    if _MIC["muted"]:
+        _MIC.update(muted=False, mode="open", gen=_MIC["gen"] + 1)
+        log("[console] talk key: hands-free listening back on")
 
 # Approvals are EXACT matches after normalization, never prefixes:
 # "yesterday", "yes or no", and "yes, but do not overwrite" must all
@@ -314,6 +323,7 @@ CONSOLE_VERBS = {
                   "hands free listening", "open mic", "open the mic"),
     "micptt":    ("push to talk", "push to talk mode",
                   "back to push to talk", "back to the button"),
+    "micmute":   ("stop listening", "mute yourself", "mute the mic"),
     "noask":     ("stop asking for permission",
                   "stop asking permission",
                   "stop asking me for permission",
@@ -600,7 +610,7 @@ async def amain():
             resume_id = None
 
     mouth = Mouth()
-    ears = Ears()
+    ears = Ears(silence_ms=int(CFG.get("open_mic_silence_ms") or 480))
     # can_use_tool needs brain.remote_sink, but brain needs can_use_tool
     # at construction — broken by constructing without it, then setting
     # it once the gate has a real brain to close over.
@@ -708,6 +718,7 @@ async def amain():
                 mouth.say("Already in hands-free listening.")
             else:
                 _MIC["mode"] = "open"
+                _MIC["muted"] = False
                 _MIC["gen"] += 1
                 _write_config_key("mic_mode", "open")
                 log("[console] mic_mode -> open (hands-free listening)")
@@ -718,16 +729,28 @@ async def amain():
                           "to talk mode to bring the button back.")
         elif verb == "micptt":
             resp = ""
-            if _MIC["mode"] == "ptt":
+            if _MIC["mode"] == "ptt" and not _MIC["muted"]:
                 mouth.say("Already on push to talk.")
             else:
                 _MIC["mode"] = "ptt"
+                _MIC["muted"] = False
                 _MIC["gen"] += 1
                 _write_config_key("mic_mode", "ptt")
                 log("[console] mic_mode -> ptt")
                 key = str(CFG.get("ptt_key", "home")).replace("_", " ")
                 mouth.say(f"Push to talk. Hold the {key} key and "
                           "talk; the mic stays closed otherwise.")
+        elif verb == "micmute":
+            resp = ""
+            if _MIC["mode"] != "open":
+                mouth.say("The open mic is already off; I only hear "
+                          "the talk key.")
+            else:
+                # Not persisted: a restart comes back hands-free.
+                _MIC.update(muted=True, mode="ptt", gen=_MIC["gen"] + 1)
+                log("[console] open mic muted until the next talk-key press")
+                mouth.say("Not listening. Press the talk key when you "
+                          "want me back.")
         elif verb == "noask":
             resp = ""
             _CONFIRM["verb"] = "noask"
@@ -1019,6 +1042,7 @@ async def amain():
                     text = None
                 finally:
                     _MIC["btn"] = False
+                    _unmute()
                 mouth.ducker.speech_end(0.2)     # snap back fast on release
                 if not text:
                     log("[ptt] (tap or empty — ignored)")
@@ -1050,6 +1074,7 @@ async def amain():
                     text = None
                 finally:
                     _MIC["btn"] = False
+                    _unmute()
                 mouth.ducker.speech_end(0.2)
                 if not text:
                     log("[web] (tap or empty — ignored)")
