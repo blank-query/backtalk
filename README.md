@@ -4,13 +4,13 @@
 
 This is a fork of [jaredrhod/backtalk](https://github.com/jaredrhod/backtalk). Everything below this section is the original README, and nearly all of the work is his. The `remote` branch adds what it takes to talk to the agent from a web browser on another device, not only at the machine running it:
 
-- **Browser bridge:** a WebSocket server (`web.py`) that the face in [this ai-visualizer fork](https://github.com/blank-query/ai-visualizer) connects to. Tap the face to talk; the browser records the mic and plays the reply, so the server needs no audio hardware. Set it up with the `web` block in `backtalk.json` (`enabled`, `host`, `port`).
+- **Browser bridge:** a WebSocket server (`web.py`) that the face in [this ai-visualizer fork](https://github.com/blank-query/network-ai-visualizer) connects to. Tap the face to talk; the browser records the mic and plays the reply, so the server needs no audio hardware. Set it up with the `web` block in `backtalk.json` (`enabled`, `host`, `port`).
 - **Several tabs or devices at once:** each one records independently, gets its own replies, and animates only for its own turns, all sharing one Claude Code session.
 - **Queue and Interrupt:** a tap while the agent is talking queues the next question, and the Interrupt button stops the reply, browser audio included.
 - **Piper as an optional voice engine,** for small hardware like a Raspberry Pi where Kokoro is too slow (`piper.enabled` and `piper.model_path`, plus optional `speaker_id` and `length_scale`).
 - **Fixes along the way:** one continuous reader for the session's turn stream (replies no longer arrive one behind after background tasks), real-time pacing for browser-only replies, permission prompts that reach the browser, and a live count of background tasks for the face.
 
-To run the whole stack in Docker on a home server, see [`docker/` in this fullstack-agent fork](https://github.com/blank-query/fullstack-agent/tree/remote/docker).
+To run the whole stack in Docker on a home server, see [`docker/` in this fullstack-agent fork](https://github.com/blank-query/network-fullstack-agent/tree/remote/docker).
 
 > **Never used Claude Code?** Start at [jaredrhod.com](https://jaredrhod.com): pick your situation and it routes you to the right path.
 
