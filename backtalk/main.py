@@ -65,8 +65,6 @@ import threading
 from difflib import SequenceMatcher
 import time
 
-import numpy as np
-
 from backtalk import signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
@@ -75,7 +73,7 @@ from backtalk.ears import (Ears, Session, explain_audio_failure, record_held,
 from backtalk.mouth import DIRECTION_HOOKS, Mouth, synth_stream
 from backtalk.ptt import PTTListener
 from backtalk.vlog import log
-from backtalk.web import BrowserBridge, ListenStream
+from backtalk.web import BrowserBridge, ListenStream, chime
 
 NAME = CFG["name"]
 # When the last spoken (not typed) question came in, any device; see handle().
@@ -1028,6 +1026,8 @@ async def amain():
             text in this voice, on that device only. Not delivered (no
             such device, or it isn't connected): the agent is told."""
             for d in directions:
+                if d.startswith("call "):
+                    _call(d[5:], asker)
                 if not d.startswith("announce "):
                     continue
                 try:
@@ -1044,15 +1044,32 @@ async def amain():
                 threading.Thread(target=_play_announcement, daemon=True,
                                  args=(conn, str(a.get("text") or ""))).start()
 
+        def _call(arg: str, asker):
+            """<<call {"to": name}>>: an intercom call from the asking
+            device to that one (web.Call). Not placed: the agent is told."""
+            def place():
+                try:
+                    to = str(json.loads(arg)["to"])
+                    callee = bridge.find(to)
+                    caller = next((c for c in list(bridge._conns) if c.id is not None
+                                   and c.id == getattr(asker, "conn_id", None)
+                                   and not c.disconnected), None)
+                    if caller is None:
+                        raise LookupError("a call has to be asked for from a device")
+                    if callee is None:
+                        names = ", ".join(v.get("name", "?") for v in bridge.devices().values())
+                        raise LookupError(f"{to!r} isn't connected (devices: {names})")
+                    bridge.start_call(caller, callee)
+                except Exception as e:
+                    log(f"[call] not placed: {e}")
+                    brain.ask(f"[Call not placed: {e}]", asker)
+            loop.call_soon_threadsafe(place)
+
         def _play_announcement(conn, text: str):
             sink = bridge.make_sink(conn)
             chunks = list(synth_stream(text))
             rate = chunks[0][0]
-            t = np.arange(int(rate * 0.14)) / rate          # the chime: two soft tones
-            env = np.sin(np.pi * t / t[-1])
-            chime = np.concatenate([np.sin(2 * np.pi * f * t) * env for f in (880, 1320)]
-                                   + [np.zeros(int(rate * 0.2))])
-            sink(rate, (chime * 9000).astype(np.int16))
+            sink(rate, chime(rate))
             for r, pcm in chunks:
                 sink(r, pcm)
             sink.reply_done()

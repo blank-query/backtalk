@@ -81,6 +81,16 @@ Wire protocol, deliberately tiny:
                                              {"type": "lines", "lines":
                                              [...]} replays the last 60
                                              on hello
+  text frame  {"type": "call", "on": b,     server -> client: an intercom
+               "with": name}                 call started or ended. While
+                                             on, the client streams its mic
+                                             (call-mode echo cancellation)
+                                             and plays what arrives; the
+                                             bridge relays the frames to
+                                             the other end, untranscribed
+  text frame  {"type": "hangup"}            client -> server: end the call
+                                             (so does a press, or either
+                                             end disconnecting)
   text frame  {"type": "listen", "on": b,   server -> browser: hands-
                "muted": b}
                                              free on or off for that
@@ -117,6 +127,33 @@ import websockets
 from backtalk.vlog import log
 
 RATE = 16000   # must match ears.RATE — the fixed transcribe() contract
+CALL_VOICE_RMS = 500   # a caller frame this loud opens the call at the far end
+CALL_RING_S = 20       # the caller has this long to start talking
+
+
+def chime(rate: int) -> np.ndarray:
+    """Two soft rising tones and a beat of silence: an announcement or a
+    call is coming."""
+    t = np.arange(int(rate * 0.14)) / rate
+    env = np.sin(np.pi * t / t[-1])
+    c = np.concatenate([np.sin(2 * np.pi * f * t) * env for f in (880, 1320)]
+                       + [np.zeros(int(rate * 0.2))])
+    return (c * 9000).astype(np.int16)
+
+
+class Call:
+    """An intercom call. The caller speaks first: their frames are held
+    until one is loud enough, then the far end gets a chime, the call
+    frame (its mic opens), and the held audio, and after that every frame
+    goes straight across both ways."""
+
+    def __init__(self, caller: "Conn", callee: "Conn"):
+        self.caller, self.callee = caller, callee
+        self.open = False
+        self.held: collections.deque = collections.deque(maxlen=12)
+
+    def peer(self, conn: "Conn") -> "Conn":
+        return self.callee if conn is self.caller else self.caller
 
 
 class Conn:
@@ -135,6 +172,7 @@ class Conn:
         self.recording = False   # this tab's own slot, not bridge-wide
         self.listening = False   # hands-free: frames outside a press
         self.listen_muted = False   # paused: hearing only "start listening"
+        self.call: Call | None = None   # an intercom call: audio relays, untranscribed
         # Read from a worker thread (ListenStream), hence queue.Queue.
         # Bounded: a stalled listener drops audio, never memory.
         self._listen_q: "queue.Queue[bytes]" = queue.Queue(maxsize=500)
@@ -146,7 +184,9 @@ class Conn:
         try:
             async for msg in self.ws:
                 if isinstance(msg, (bytes, bytearray)):
-                    if self.recording:
+                    if self.call is not None:
+                        self.bridge._call_audio(self, bytes(msg))
+                    elif self.recording:
                         await self._frames.put(bytes(msg))
                     elif self.listening:
                         try:
@@ -171,6 +211,8 @@ class Conn:
                         self.bridge.on_text(self, t)
                     if self.id in self.bridge._hf_ids:
                         self.bridge.set_listening(self, True)
+                elif kind in ("hangup", "press", "interrupt_press") and self.call:
+                    self.bridge.end_call(self.call, "hung up")
                 elif kind == "press":
                     self.bridge._on_press(self, interrupt=False)
                 elif kind == "interrupt_press":
@@ -197,6 +239,8 @@ class Conn:
             pass
         finally:
             self.disconnected = True
+            if self.call is not None:
+                self.bridge.end_call(self.call, "disconnected")
             self._released.set()         # unblock a capture awaiting release
             await self._frames.put(None)  # unblock a capture awaiting a frame
 
@@ -325,6 +369,59 @@ class BrowserBridge:
                if str(d.get("name", "")).casefold() == name.strip().casefold()}
         return next((c for c in list(self._conns)
                      if c.id in ids and not c.disconnected), None)
+
+    # ---- intercom (see Call). start_call and end_call run on the loop.
+
+    def start_call(self, caller: Conn, callee: Conn):
+        if caller is callee:
+            raise ValueError("that's the device asking")
+        busy = [c for c in (caller, callee) if c.call is not None]
+        if busy:
+            raise RuntimeError(f"{self.name_of(busy[0].id)} is already on a call")
+        call = Call(caller, callee)
+        caller.call = callee.call = call
+        self._send(caller, {"type": "call", "on": True, "with": self.name_of(callee.id)})
+        self._loop.call_later(CALL_RING_S, lambda: call.open or self.end_call(call, "nobody spoke"))
+        log(f"[call] {self.name_of(caller.id)} -> {self.name_of(callee.id)}: waiting for the caller to speak")
+
+    def end_call(self, call: Call, why: str):
+        if call.caller.call is not call:
+            return                          # already over
+        for c in (call.caller, call.callee):
+            c.call = None
+            if c is call.caller or call.open:
+                self._send(c, {"type": "call", "on": False})
+        log(f"[call] {self.name_of(call.caller.id)} -> {self.name_of(call.callee.id)} ended: {why}")
+
+    def _call_audio(self, conn: Conn, frame: bytes):
+        call = conn.call
+        if call.open:
+            self._send(call.peer(conn), frame)
+            return
+        if conn is not call.caller or len(frame) < 6:
+            return                          # the far end isn't on yet
+        call.held.append(frame)
+        pcm = np.frombuffer(frame[4:len(frame) - (len(frame) - 4) % 2], dtype=np.int16)
+        if np.sqrt(np.mean(pcm.astype(np.float32) ** 2)) < CALL_VOICE_RMS:
+            return
+        call.open = True
+        rate = struct.unpack_from("<I", frame, 0)[0]
+        self._send(call.callee, struct.pack("<I", rate) + chime(rate).tobytes())
+        self._send(call.callee, {"type": "call", "on": True, "with": self.name_of(conn.id)})
+        while call.held:
+            self._send(call.callee, call.held.popleft())
+        log(f"[call] {self.name_of(conn.id)} -> {self.name_of(call.callee.id)}: connected")
+
+    def _send(self, conn: Conn, obj):
+        """One frame (bytes) or message (dict) to a connection, from the loop."""
+        data = obj if isinstance(obj, bytes) else json.dumps(obj)
+
+        async def send():
+            try:
+                await conn.ws.send(data)
+            except Exception:
+                pass                        # gone; its reader ends the call
+        asyncio.ensure_future(send())
 
     async def stop(self):
         if self._server is not None:
