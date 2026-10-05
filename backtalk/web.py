@@ -61,6 +61,14 @@ Wire protocol, deliberately tiny:
                                              {"type": "image_used"} once
                                              it rides along with a
                                              question
+  text frame  {"type": "phone", "do": ...}  server -> client: a command for
+                                             the device that asked (the
+                                             agent's <<phone {...}>> tag;
+                                             see mouth.py)
+  text frame  {"type": "phone_result",      client -> server: what came of
+               "text": ...}                  it, when the agent needs to
+                                             know (a failure, a lookup);
+                                             asked as that device's turn
   text frame  {"type": "listen", "on": b,   server -> browser: hands-
                "muted": b}
                                              free on or off for that
@@ -155,6 +163,8 @@ class Conn:
                     # on + muted = paused
                     self.bridge.set_listening(self, bool(data.get("on")),
                                               muted=bool(data.get("muted")))
+                elif kind == "phone_result" and self.bridge.on_phone_result is not None:
+                    self.bridge.on_phone_result(self, str(data.get("text") or ""))
                 elif kind == "image" and self.bridge.on_image is not None:
                     try:
                         self.bridge.on_image(self, base64.b64decode(data.get("data") or ""))
@@ -188,6 +198,7 @@ class BrowserBridge:
         self._hf_ids: set[str] = set()
         self.on_listen = None   # main.py: start a listener for a Conn
         self.on_image = None    # main.py: (Conn, jpeg bytes), a shared picture
+        self.on_phone_result = None   # main.py: (Conn, text) from a phone command
 
     async def serve(self):
         self._loop = asyncio.get_running_loop()

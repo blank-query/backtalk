@@ -66,8 +66,9 @@ from backtalk.vlog import log
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 # <<anything>> is a stage direction: lifted out, never spoken, published on
 # the bus when the audio carrying it starts. Bounded so a runaway model
-# cannot swallow a paragraph into one "tag".
-_DIRECTION_TAG = re.compile(r"<<([^<>]{1,80})>>")
+# cannot swallow a paragraph into one "tag" (long enough for a phone
+# command's text message; see mouth.py's "phone" directions).
+_DIRECTION_TAG = re.compile(r"<<([^<>]{1,600})>>")
 FLUSH_AFTER = 0.75   # seconds of silence before a lone sentence is spoken,
                      # see the Backtalk Orphaned Sentence Bug note
 

@@ -39,6 +39,7 @@ HARD-WON AUDIO LAW #2 — buffer ~0.75s of synthesized audio before a
 sentence starts playing, so a slower machine never underruns into
 slow-motion garble.
 """
+import json
 import os
 import queue
 import re
@@ -359,6 +360,32 @@ def _stream_piper(text: str):
             yield rate, a
 
 
+def _phone_frames(directions):
+    """The <<phone {...}>> directions as (json text, frame or the error).
+    A "voice" command carries its recording: `say`, spoken in this voice,
+    as a base64 WAV for the phone to attach to a message.
+    ponytail: WAV, not compressed; fine for a sentence or two (about 45 KB
+    a second at Piper's rate), encode to AAC if messages get long."""
+    out = []
+    for d in directions or ():
+        if not d.startswith("phone "):
+            continue
+        try:
+            frame = {"type": "phone", **json.loads(d[6:])}
+            if frame.get("do") == "voice":
+                import base64, io, wave
+                chunks = list(synth_stream(str(frame.get("say") or "")))
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as w:
+                    w.setnchannels(1); w.setsampwidth(2); w.setframerate(chunks[0][0])
+                    w.writeframes(b"".join(p.astype(np.int16).tobytes() for _, p in chunks))
+                frame["audio"] = base64.b64encode(buf.getvalue()).decode()
+            out.append((d[6:], frame))
+        except Exception as e:
+            out.append((d[6:], e))
+    return out
+
+
 def synth_stream(text: str, timeout: float = 30.0):
     """_synth_raw with the configured gain_db applied to each chunk."""
     g = 10 ** (float(CFG.get("gain_db") or 0) / 20)
@@ -554,6 +581,7 @@ class Mouth:
         from backtalk import signals
         local_on = bool(CFG.get("web", {}).get(
             "local_playback_on_remote_turn", True)) or remote_sink is None
+        phone = _phone_frames(directions)   # before this sentence's own synthesis
         gen = synth_stream(sentence)
         head: list = []
         banked = 0
@@ -592,6 +620,16 @@ class Mouth:
             if directions:
                 from backtalk import signals as _sig
                 _sig.direction(directions)
+                # <<phone {json}>>: a command for the device that asked
+                # (the Android app), sent as the sentence carrying it is
+                # heard, so an interrupted reply never fires it.
+                send = getattr(remote_sink, "send", None)
+                for d, frame in phone:
+                    if send is None or isinstance(frame, Exception):
+                        log(f"[phone] not sent ({frame if send else 'no device asked this turn'}): {d[:200]}")
+                    else:
+                        send(frame)
+                        log(f"[phone] sent: {d[:200]}")
 
             def _write(pcm):
                 for i in range(0, len(pcm), block):

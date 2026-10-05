@@ -1002,6 +1002,15 @@ async def amain():
             images.setdefault(conn.id, []).append(p)
             log(f"[web] image from {str(conn.id)[:8]}: {p} ({len(data) // 1024} KB)")
 
+        def _on_phone_result(conn, text: str):
+            """A phone command's outcome the agent needs (a failure, a
+            contact lookup): asked as that device's turn, so the answer
+            goes back there."""
+            log(f"[phone] result from {str(conn.id)[:8]}: {text[:200]}")
+            signals.set_state("thinking")
+            brain.ask(f"[The phone reports back on your last command: {text}]",
+                      remote_sink=bridge.make_sink(conn))
+
         # Browser hands-free: one listener thread per listening tab,
         # the same Ears endpointing and filters as the local open mic,
         # fed from that tab's stream. Utterances land in hf_q.
@@ -1114,6 +1123,7 @@ async def amain():
             bridge = BrowserBridge(CFG["web"])
             bridge.on_listen = _hf_listen
             bridge.on_image = _on_image
+            bridge.on_phone_result = _on_phone_result
             brain.remote_sink = bridge.make_broadcast_sink()
             asyncio.create_task(bridge.serve())
         ptt = PTTListener(CFG["ptt_key"])
