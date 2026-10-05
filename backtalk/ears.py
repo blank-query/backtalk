@@ -452,6 +452,8 @@ class Session:
     def finish(self) -> str:
         t0 = time.time()
         text = self._finish()
+        for pattern, fix in CFG.get("stt_corrections") or []:
+            text = re.sub(pattern, fix, text, flags=re.IGNORECASE)
         if text:
             engine = "moonshine" if self._moon is not None else "whisper"
             log(f"[ears] heard in {time.time() - t0:.2f}s after you stopped ({engine})")
