@@ -1003,7 +1003,7 @@ async def amain():
                 while not stop():
                     try:
                         text = hf_ears.listen_once(stream=stream, gate=gate,
-                                                   on_speech=lambda: setattr(conn, "active", time.monotonic()),
+                                                   busy=lambda b: setattr(conn, "capturing", b),
                                                    abort=stop)
                     except Exception as e:
                         log(f"[web] hands-free listener failed: {e!r}")
@@ -1028,12 +1028,17 @@ async def amain():
                 for c in conns:
                     c.active = now
                 return
+            # Mid-capture, wait: it may be you talking through noise. Only
+            # transcribed words reset the clock, so pure noise (which ends
+            # as an empty capture, 30 s at most) can't keep it on forever.
             for c in conns:
-                if c.listening and now - getattr(c, "active", now) > limit:
+                if c.listening and not getattr(c, "capturing", False) \
+                        and now - getattr(c, "active", now) > limit:
                     bridge.set_listening(c, False)
                     log(f"[web] hands-free timed out for {str(c.id)[:8]}")
                     mouth.say("Hands-free off.", remote_sink=bridge.make_sink(c))
-            if _MIC["mode"] == "open" and now - _MIC["active"] > limit:
+            if _MIC["mode"] == "open" and not _MIC.get("capturing") \
+                    and now - _MIC["active"] > limit:
                 _MIC.update(mode="ptt", muted=False, gen=_MIC["gen"] + 1)
                 _write_config_key("mic_mode", "ptt")
                 log("[console] hands-free timed out -> ptt")
@@ -1123,7 +1128,7 @@ async def amain():
                     mic_fut = loop.run_in_executor(
                         None, lambda g=g: (g, ears.listen_once(
                             gate=mic_gate,
-                            on_speech=lambda: _MIC.__setitem__("active", time.monotonic()),
+                            busy=lambda b: _MIC.__setitem__("capturing", b),
                             abort=lambda: _MIC["gen"] != g)))
                 waiters.add(mic_fut)
             if bridge is not None:

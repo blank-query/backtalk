@@ -488,7 +488,7 @@ class Ears:
         self.silence_frames = silence_ms // FRAME_MS
 
     def listen_once(self, gate=None, timeout_s: float | None = None,
-                    abort=None, stream=None, on_speech=None) -> str | None:
+                    abort=None, stream=None, busy=None) -> str | None:
         """Block until one utterance completes; return transcript
         (or None on timeout). An `abort` callable is checked every
         frame; returning True closes the mic and returns None, which
@@ -521,8 +521,6 @@ class Ears:
                         ring.clear()
                         continue
                     is_speech = self.vad.is_speech(mono.tobytes(), RATE)
-                    if is_speech and on_speech:
-                        on_speech()      # someone's talking: not idle
                     if not in_utterance:
                         ring.append(mono)
                         if len(ring) > 8:
@@ -535,6 +533,7 @@ class Ears:
                             session = Session(vad=True)
                             for f in frames:
                                 session.add(f)
+                            if busy: busy(True)   # capturing: idle timers wait
                     else:
                         frames.append(mono)
                         session.add(mono)
@@ -552,6 +551,7 @@ class Ears:
                                 frames, ring = [], []
                                 speech_run = speech_total = 0
                                 session.cancel(); session = None
+                                if busy: busy(False)
                                 continue
                             text = session.finish(); session = None
                             words = re.findall(r"[a-z']+", text.lower())
@@ -560,6 +560,7 @@ class Ears:
                                 return ""
                             return text
         finally:
+            if busy: busy(False)
             if session is not None:      # aborted mid-utterance
                 session.cancel()
 
