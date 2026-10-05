@@ -27,6 +27,7 @@ listening (so the open mic ignores the speakers unless barge-in is on).
 """
 import platform
 import queue
+import time
 import re
 import sys
 import threading
@@ -449,8 +450,22 @@ class Session:
             self._q = None
 
     def finish(self) -> str:
+        t0 = time.time()
+        text = self._finish()
+        if text:
+            engine = "moonshine" if self._moon is not None else "whisper"
+            log(f"[ears] heard in {time.time() - t0:.2f}s after you stopped ({engine})")
+        return text
+
+    def _finish(self) -> str:
         pcm = (np.concatenate(self.frames) if self.frames
                else np.zeros(0, dtype=np.int16))
+        if CFG.get("stt_save_dir") and len(pcm):   # debugging: keep the audio
+            import os, time, wave
+            path = os.path.join(CFG["stt_save_dir"], time.strftime("%H%M%S.wav"))
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
+                w.writeframes(pcm.astype(np.int16).tobytes())
         if self._q is None:
             return transcribe(pcm, vad=self.vad) if len(pcm) else ""
         self._q.put(None)

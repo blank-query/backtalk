@@ -44,6 +44,7 @@ never the character.
 import asyncio
 import os
 import re
+import time
 import warnings
 from collections import deque
 from datetime import datetime
@@ -104,6 +105,7 @@ class WarmBrain:
         # position guessed out of a queue.
         self._ask_queue: deque = deque()
         self._current_asker = None   # remote_sink owed the in-flight turn
+        self._ask_t0 = None          # when that turn's ask went out, for the log
         # Session usage, spoken on request ("usage report").
         self.session = {"turns": 0, "out_tokens": 0, "in_tokens": 0,
                         "cost": 0.0}
@@ -195,7 +197,7 @@ class WarmBrain:
         marker overrides this one (see signals.set_playing_conn)."""
         if self._turn_active or not self._ask_queue:
             return
-        utterance, remote_sink = self._ask_queue.popleft()
+        utterance, remote_sink, self._ask_t0 = self._ask_queue.popleft()
         self._turn_active = True
         self._current_asker = remote_sink
         signals.set_active_conn(getattr(remote_sink, "conn_id", None))
@@ -330,7 +332,7 @@ class WarmBrain:
         already running, this just queues: the session never has two
         queries outstanding at once, so there's never ambiguity about
         which asker a turn belongs to later."""
-        self._ask_queue.append((utterance, remote_sink))
+        self._ask_queue.append((utterance, remote_sink, time.time()))
         self._dispatch_next()
 
     async def capture(self, text: str, count_turn: bool = True) -> str:
@@ -451,7 +453,12 @@ class WarmBrain:
                         and not turn_sink.is_live():
                     turn_sink = None
                 turn_sink = turn_sink or self.remote_sink
-                log(f"[Jarvis] {s}"
+                # time from the ask going out to the first spoken sentence
+                # (a turn nobody asked for, a background report, has none)
+                lag = (f"({time.time() - self._ask_t0:.1f}s to first) "
+                       if self._ask_t0 else "")
+                self._ask_t0 = None
+                log(f"[Jarvis] {lag}{s}"
                     + (f"  <directions: {pending}>" if pending else ""))
                 self.mouth.say_chunk(s, pending, turn_sink)
                 pending = []
