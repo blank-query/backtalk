@@ -54,6 +54,13 @@ Wire protocol, deliberately tiny:
   text frame  {"type": "hands_free",        browser -> server: switch
                "on": b, "muted": b}          hands-free on, paused, or off
                                              for this tab, silently
+  text frame  {"type": "image", "data": b64}  client -> server: a shared
+                                             JPEG (the app's share
+                                             target); acked with
+                                             {"type": "image_ok"}, and
+                                             {"type": "image_used"} once
+                                             it rides along with a
+                                             question
   text frame  {"type": "listen", "on": b,   server -> browser: hands-
                "muted": b}
                                              free on or off for that
@@ -76,6 +83,7 @@ one loop — never iterate `conn.ws` a second time anywhere else.
 """
 import asyncio
 import audioop
+import base64
 import json
 import queue
 import struct
@@ -147,6 +155,12 @@ class Conn:
                     # on + muted = paused
                     self.bridge.set_listening(self, bool(data.get("on")),
                                               muted=bool(data.get("muted")))
+                elif kind == "image" and self.bridge.on_image is not None:
+                    try:
+                        self.bridge.on_image(self, base64.b64decode(data.get("data") or ""))
+                        await self.ws.send(json.dumps({"type": "image_ok"}))
+                    except Exception as e:
+                        log(f"[web] shared image dropped: {e}")
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
@@ -173,6 +187,7 @@ class BrowserBridge:
         # restart returns every browser to push-to-talk.
         self._hf_ids: set[str] = set()
         self.on_listen = None   # main.py: start a listener for a Conn
+        self.on_image = None    # main.py: (Conn, jpeg bytes), a shared picture
 
     async def serve(self):
         self._loop = asyncio.get_running_loop()
@@ -187,7 +202,8 @@ class BrowserBridge:
             finally:
                 self._conns.discard(conn)
 
-        self._server = await websockets.serve(handler, host, port)
+        self._server = await websockets.serve(handler, host, port,
+                                              max_size=16 * 2**20)   # shared pictures
         log(f"[web] browser bridge listening on ws://{host}:{port}")
         await self._server.wait_closed()
 
@@ -312,31 +328,27 @@ class BrowserBridge:
             except Exception:
                 pass
 
-        def _reply_done():
+        def _send(obj: dict):
             c = live()
             if c is None or loop is None:
                 return
             try:
-                asyncio.run_coroutine_threadsafe(
-                    c.ws.send(json.dumps({"type": "reply_done"})), loop)
+                asyncio.run_coroutine_threadsafe(c.ws.send(json.dumps(obj)), loop)
             except Exception:
                 pass
+
+        def _reply_done():
+            _send({"type": "reply_done"})
 
         def _stop():
             """An interrupt: tell the browser to discard every chunk
             already sent but not yet played — mirrors mouth.shut_up()
             on this end."""
-            c = live()
-            if c is None or loop is None:
-                return
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    c.ws.send(json.dumps({"type": "stop"})), loop)
-            except Exception:
-                pass
+            _send({"type": "stop"})
 
         _sink.reply_done = _reply_done
         _sink.stop = _stop
+        _sink.send = _send
         _sink.conn_id = conn.id
         _sink.conn = conn
         # Live lookup, not a snapshot: a sink can sit queued in

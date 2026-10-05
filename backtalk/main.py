@@ -54,7 +54,9 @@ Flags:
 Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 """
 import asyncio
+import glob
 import json
+import os
 import queue
 import re
 import socket
@@ -948,6 +950,11 @@ async def amain():
         tail_verb, text = trailing_mic_verb(text)
         if tail_verb:
             await run_console(tail_verb, remote_sink)
+        shared = images.pop(getattr(remote_sink, "conn_id", None), None)
+        if shared:
+            text = ("[The user shared an image with this message; view it "
+                    f"with the Read tool: {', '.join(shared)}] {text}")
+            remote_sink.send({"type": "image_used"})
         signals.set_state("thinking")
         signals.static_start()
         _deny_pending()
@@ -977,6 +984,23 @@ async def amain():
         # for that. brain.remote_sink stays the broadcast one, for
         # turns nobody specific asked for (background reports).
         bridge: BrowserBridge | None = None
+
+        # Pictures shared from a device (the app's share target), by
+        # device id: saved where the agent can read them, and attached to
+        # that device's next question.
+        images: dict[str, list[str]] = {}
+
+        def _on_image(conn, data: bytes):
+            d = os.path.join(CFG["agent_dir"], ".backtalk", "images")
+            os.makedirs(d, exist_ok=True)
+            for old in sorted(glob.glob(os.path.join(d, "*.jpg")))[:-30]:
+                os.remove(old)   # keep the last 30
+            p = os.path.join(d, time.strftime("%Y%m%d-%H%M%S-")
+                             + f"{time.monotonic_ns() % 10**6}.jpg")
+            with open(p, "wb") as f:
+                f.write(data)
+            images.setdefault(conn.id, []).append(p)
+            log(f"[web] image from {str(conn.id)[:8]}: {p} ({len(data) // 1024} KB)")
 
         # Browser hands-free: one listener thread per listening tab,
         # the same Ears endpointing and filters as the local open mic,
@@ -1089,6 +1113,7 @@ async def amain():
         if CFG.get("web", {}).get("enabled"):
             bridge = BrowserBridge(CFG["web"])
             bridge.on_listen = _hf_listen
+            bridge.on_image = _on_image
             brain.remote_sink = bridge.make_broadcast_sink()
             asyncio.create_task(bridge.serve())
         ptt = PTTListener(CFG["ptt_key"])
