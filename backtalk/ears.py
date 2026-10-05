@@ -530,10 +530,10 @@ class Ears:
                             in_utterance = True
                             frames = ring[:]
                             silence_run = 0
+                            if busy: busy(True)   # first, so the rings show at once
                             session = Session(vad=True)
                             for f in frames:
                                 session.add(f)
-                            if busy: busy(True)   # capturing: idle timers wait
                     else:
                         frames.append(mono)
                         session.add(mono)
