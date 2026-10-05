@@ -72,6 +72,15 @@ Wire protocol, deliberately tiny:
                "text": ...}                  it, when the agent needs to
                                              know (a failure, a lookup);
                                              asked as that device's turn
+  text frame  {"type": "text", "text": ...}  client -> server: a typed
+                                             question (the face's
+                                             terminal), queued like a tap
+  text frame  {"type": "line", "who":       server -> client: the
+               "you"|"jarvis", "text": ...}  conversation as text, this
+                                             device's turns only;
+                                             {"type": "lines", "lines":
+                                             [...]} replays the last 60
+                                             on hello
   text frame  {"type": "listen", "on": b,   server -> browser: hands-
                "muted": b}
                                              free on or off for that
@@ -95,6 +104,7 @@ one loop — never iterate `conn.ws` a second time anywhere else.
 import asyncio
 import audioop
 import base64
+import collections
 import json
 import os
 import queue
@@ -152,6 +162,13 @@ class Conn:
                 if kind == "hello":
                     self.id = data.get("device_id") or self.id
                     self.bridge.saw(self, data.get("model"))
+                    if self.bridge._lines.get(self.id):
+                        await self.ws.send(json.dumps(
+                            {"type": "lines", "lines": list(self.bridge._lines[self.id])}))
+                elif kind == "text" and self.bridge.on_text is not None:
+                    t = str(data.get("text") or "").strip()[:4000]
+                    if t:
+                        self.bridge.on_text(self, t)
                     if self.id in self.bridge._hf_ids:
                         self.bridge.set_listening(self, True)
                 elif kind == "press":
@@ -205,6 +222,10 @@ class BrowserBridge:
         self.on_image = None    # main.py: (Conn, jpeg bytes), a shared picture
         self.on_phone_result = None   # main.py: (Conn, text) from a phone command
         self.devices_file = None      # main.py: the device names (see saw)
+        self.on_text = None           # main.py: (Conn, text) typed in the terminal
+        # Each device's recent conversation lines, replayed on hello so a
+        # reload keeps its terminal. Memory only.
+        self._lines: dict[str, collections.deque] = {}
 
     async def serve(self):
         self._loop = asyncio.get_running_loop()
@@ -284,6 +305,8 @@ class BrowserBridge:
         d = devs.setdefault(conn.id, {"name": model or f"browser {conn.id[:4]}"})
         if model:
             d["model"] = model
+            if d.get("name") == f"browser {conn.id[:4]}":
+                d["name"] = model     # first seen on an app too old to say
         d["seen"] = time.strftime("%Y-%m-%d %H:%M")
         tmp = self.devices_file + ".tmp"
         try:
@@ -384,6 +407,8 @@ class BrowserBridge:
                 pass
 
         def _send(obj: dict):
+            if obj.get("type") == "line" and conn.id:
+                self._lines.setdefault(conn.id, collections.deque(maxlen=60)).append(obj)
             c = live()
             if c is None or loop is None:
                 return
@@ -432,8 +457,13 @@ class BrowserBridge:
             for conn in list(self._conns):
                 self.make_sink(conn).stop()
 
+        def _send(obj: dict):
+            for conn in list(self._conns):
+                self.make_sink(conn).send(obj)
+
         _sink.reply_done = _reply_done
         _sink.stop = _stop
+        _sink.send = _send
         return _sink
 
 

@@ -887,6 +887,8 @@ async def amain():
         asking connection, so its reply routes back there instead of
         broadcasting; see brain.py's ask()."""
         log(f"[you]    {text}")
+        if hasattr(remote_sink, "send"):
+            remote_sink.send({"type": "line", "who": "you", "text": text})
         # A pending spoken permission ask owns the next utterance IF
         # that utterance started after the ask was posed. Speech that
         # began earlier is the user interrupting the turn, not
@@ -1165,6 +1167,7 @@ async def amain():
             bridge.on_listen = _hf_listen
             bridge.on_image = _on_image
             bridge.on_phone_result = _on_phone_result
+            bridge.on_text = lambda conn, t: hf_q.put_nowait((conn, t, "typed"))
             bridge.devices_file = os.path.join(CFG["agent_dir"], ".backtalk", "devices.json")
             os.makedirs(os.path.dirname(bridge.devices_file), exist_ok=True)
             DIRECTION_HOOKS.append(_announce)
@@ -1243,7 +1246,19 @@ async def amain():
             done, _ = await asyncio.wait(
                 waiters, return_when=asyncio.FIRST_COMPLETED)
             if hf_fut is not None and hf_fut in done:
-                conn, text = hf_fut.result(); hf_fut = None
+                conn, text, *typed = hf_fut.result(); hf_fut = None
+                if typed:
+                    # Typed in the face's terminal: no listening checks;
+                    # queued behind a reply like a tap. A quit phrase is
+                    # ignored, as from hands-free (it would hang up every
+                    # device).
+                    if any(q in text.lower() for q in QUIT_PHRASES):
+                        log("[web] quit phrase typed, ignored")
+                        continue
+                    await handle(text, spoke_from=time.monotonic(),
+                                 interrupt=False,
+                                 remote_sink=bridge.make_sink(conn))
+                    continue
                 if conn.disconnected or not conn.listening:
                     continue
                 if conn.listen_muted:

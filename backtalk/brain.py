@@ -69,6 +69,13 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 # cannot swallow a paragraph into one "tag" (long enough for a phone
 # command's text message; see mouth.py's "phone" directions).
 _DIRECTION_TAG = re.compile(r"<<([^<>]{1,600})>>")
+def _line(sink, text: str):
+    """The reply as text for the asking device's terminal (see web.py)."""
+    send = getattr(sink, "send", None)
+    if send is not None:
+        send({"type": "line", "who": "jarvis", "text": text})
+
+
 FLUSH_AFTER = 0.75   # seconds of silence before a lone sentence is spoken,
                      # see the Backtalk Orphaned Sentence Bug note
 
@@ -461,12 +468,14 @@ class WarmBrain:
                 self._ask_t0 = None
                 log(f"[Jarvis] {lag}{s}"
                     + (f"  <directions: {pending}>" if pending else ""))
+                _line(turn_sink, s)
                 self.mouth.say_chunk(s, pending, turn_sink)
                 pending = []
                 first = False
             else:
                 log(f"[Jarvis] {s}"
                     + (f"  <directions: {pending}>" if pending else ""))
+                _line(turn_sink, s)
                 batch.append(s)
                 if len(batch) >= 2:
                     flush()
@@ -478,6 +487,10 @@ class WarmBrain:
             if tail:
                 emit(tail)
             flush()
+            if pending and self.mouth:
+                # A tag after the last sentence: nothing left to carry it,
+                # so it goes alone and fires when the speech before it ends.
+                self.mouth.say_chunk("", pending, self._current_asker if first else turn_sink)
             if first:
                 # Zero sentences yielded (brain error / empty turn): park
                 # the bus rather than leave it on "thinking" forever.

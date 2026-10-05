@@ -365,6 +365,27 @@ def _stream_piper(text: str):
 DIRECTION_HOOKS: list = []
 
 
+def _fire_directions(directions, remote_sink, phone):
+    """Publish a sentence's stage directions as its audio starts, and send
+    its <<phone {json}>> commands to the device that asked (the Android
+    app); an interrupted reply never fires them. `phone` is
+    _phone_frames(directions), built before the sentence's synthesis."""
+    from backtalk import signals
+    signals.direction(directions)
+    send = getattr(remote_sink, "send", None)
+    for d, frame in phone:
+        if send is None or isinstance(frame, Exception):
+            log(f"[phone] not sent ({frame if send else 'no device asked this turn'}): {d[:200]}")
+        else:
+            send(frame)
+            log(f"[phone] sent: {d[:200]}")
+    for hook in DIRECTION_HOOKS:
+        try:
+            hook(directions, remote_sink)
+        except Exception as e:
+            log(f"[mouth] direction hook failed: {e}")
+
+
 def _phone_frames(directions):
     """The <<phone {...}>> directions as (json text, frame or the error).
     A "voice" command carries its recording: `say`, spoken in this voice,
@@ -463,7 +484,7 @@ class Mouth:
         onto an unrelated later turn if an interrupt and a fresh turn
         overlap."""
         text = text.strip()
-        if text:
+        if text or directions:      # directions alone: see _run
             self._q.put((text, directions or None, remote_sink))
 
     def shut_up(self):
@@ -502,6 +523,14 @@ class Mouth:
             else:
                 sentence, directions, remote_sink = item, None, None
             if not sentence:
+                # Directions left over at the end of a reply (a tag after
+                # the last sentence): fire once the speech before them has
+                # played, which is now. That sentence skipped its end-of-
+                # reply bookkeeping because this item was still queued.
+                if directions:
+                    _fire_directions(directions, remote_sink, _phone_frames(directions))
+                if self._q.empty() and self._speaking.is_set():
+                    self._reply_finished(remote_sink)
                 continue
             self._stop.clear()
             self._speaking.set()
@@ -514,15 +543,19 @@ class Mouth:
                 log(f"[mouth] synth/play error: {e}")
             finally:
                 if self._q.empty():
-                    self._speaking.clear()
-                    if remote_sink is not None:
-                        remote_sink.reply_done()
-                    # The reply has genuinely stopped talking, as opposed to
-                    # the gap between two sentences of the same reply.
-                    signals.reply_done()
-                    self.ducker.speech_end()
-                    signals.clear_playing_conn()
-                    signals.set_state("idle")
+                    self._reply_finished(remote_sink)
+
+    def _reply_finished(self, remote_sink):
+        """The reply has genuinely stopped talking, as opposed to the gap
+        between two sentences of the same reply."""
+        from backtalk import signals
+        self._speaking.clear()
+        if remote_sink is not None:
+            remote_sink.reply_done()
+        signals.reply_done()
+        self.ducker.speech_end()
+        signals.clear_playing_conn()
+        signals.set_state("idle")
 
     def _get_out(self, rate: int) -> sd.OutputStream:
         """The long-lived stream (audio law #1). Reopened only when the
@@ -623,23 +656,7 @@ class Mouth:
             # (see signals.set_playing_conn).
             signals.set_playing_conn(getattr(remote_sink, "conn_id", None))
             if directions:
-                from backtalk import signals as _sig
-                _sig.direction(directions)
-                # <<phone {json}>>: a command for the device that asked
-                # (the Android app), sent as the sentence carrying it is
-                # heard, so an interrupted reply never fires it.
-                send = getattr(remote_sink, "send", None)
-                for d, frame in phone:
-                    if send is None or isinstance(frame, Exception):
-                        log(f"[phone] not sent ({frame if send else 'no device asked this turn'}): {d[:200]}")
-                    else:
-                        send(frame)
-                        log(f"[phone] sent: {d[:200]}")
-                for hook in DIRECTION_HOOKS:
-                    try:
-                        hook(directions, remote_sink)
-                    except Exception as e:
-                        log(f"[mouth] direction hook failed: {e}")
+                _fire_directions(directions, remote_sink, phone)
 
             def _write(pcm):
                 for i in range(0, len(pcm), block):
