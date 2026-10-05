@@ -326,7 +326,9 @@ CONSOLE_VERBS = {
                   "unmute",
                   "hands free listening", "open mic", "open the mic"),
     "micptt":    ("push to talk", "push to talk mode",
-                  "back to push to talk", "back to the button"),
+                  "back to push to talk", "back to the button",
+                  "go push to talk", "go to push to talk",
+                  "pushed to talk", "pushed to talk mode"),  # how it's heard
     "micmute":   ("stop listening", "mute yourself", "mute the mic", "mute",
                   "pause", "paused", "stand by", "standby", "go to sleep"),
     "noask":     ("stop asking for permission",
