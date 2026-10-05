@@ -623,6 +623,7 @@ async def amain():
 
     CFG_BOOT_MODE = CFG["permission_mode"]
     _AUTOAPPROVE["on"] = CFG_BOOT_MODE == "bypassPermissions"
+    _MIC["active"] = time.monotonic()    # the hands-free idle clock
     _MIC["mode"] = "open" if (open_mic
                               or CFG.get("mic_mode") == "open") else "ptt"
     # resume_last_session: reattach to the saved conversation, if any
@@ -773,6 +774,7 @@ async def amain():
             else:
                 _MIC["mode"] = "open"
                 _MIC["muted"] = False
+                _MIC["active"] = time.monotonic()
                 _MIC["gen"] += 1
                 _write_config_key("mic_mode", "open")
                 log("[console] mic_mode -> open (hands-free listening)")
@@ -1007,6 +1009,31 @@ async def amain():
             conn.hf_thread = threading.Thread(target=work, daemon=True)
             conn.hf_thread.start()
 
+        def _hands_free_timeout(conns):
+            """Hands-free goes back to push-to-talk after
+            hands_free_timeout_s with no conversation, so it's never
+            left listening forever. A reply in progress counts as
+            conversation."""
+            limit = float(CFG.get("hands_free_timeout_s") or 0)
+            if not limit:
+                return
+            now = time.monotonic()
+            if brain.turn_active or mouth.speaking:
+                _MIC["active"] = now
+                for c in conns:
+                    c.active = now
+                return
+            for c in conns:
+                if c.listening and now - getattr(c, "active", now) > limit:
+                    bridge.set_listening(c, False)
+                    log(f"[web] hands-free timed out for {str(c.id)[:8]}")
+                    mouth.say("Hands-free off.", remote_sink=bridge.make_sink(c))
+            if _MIC["mode"] == "open" and now - _MIC["active"] > limit:
+                _MIC.update(mode="ptt", muted=False, gen=_MIC["gen"] + 1)
+                _write_config_key("mic_mode", "ptt")
+                log("[console] hands-free timed out -> ptt")
+                mouth.say("Hands-free off.")
+
         async def _publish_mic_mode():
             """One word for a glance-at-it display (signals.set_mic_mode):
             paused beats hands-free beats push-to-talk, across the local
@@ -1015,6 +1042,7 @@ async def amain():
             last = None
             while True:
                 conns = list(bridge._conns) if bridge is not None else []
+                _hands_free_timeout(conns)
                 mode = ("paused" if _MIC["muted"] or any(c.listen_muted for c in conns)
                         else "open" if _MIC["mode"] == "open" or any(c.listening for c in conns)
                         else "ptt")
@@ -1122,6 +1150,7 @@ async def amain():
                 # interrupt=False: an open mic queues behind a reply in
                 # progress rather than cutting it off; the Interrupt
                 # button is the way to stop one.
+                conn.active = time.monotonic()
                 await handle(text, spoke_from=time.monotonic(),
                              interrupt=False,
                              remote_sink=bridge.make_sink(conn))
@@ -1151,12 +1180,14 @@ async def amain():
                 mic_fut = None
                 if g != _MIC["gen"]:
                     continue             # captured before a switch
+                if text:
+                    _MIC["active"] = time.monotonic()
                 if text and not await handle(text):
                     return
                 continue
             if press_fut in done:
                 press_fut.result(); press_fut = None
-                press_t = time.monotonic()
+                press_t = _MIC["active"] = time.monotonic()
                 await _begin_capture()
                 print("[ptt] recording (release to send)...", flush=True)
                 try:
@@ -1190,7 +1221,7 @@ async def amain():
                 continue
             if ws_press_fut is not None and ws_press_fut in done:
                 conn, is_interrupt = ws_press_fut.result(); ws_press_fut = None
-                press_t = time.monotonic()
+                press_t = conn.active = time.monotonic()
                 await _begin_capture(interrupt=is_interrupt)
                 log("[web] recording (release to send)..."
                     + ("" if is_interrupt else " (queued)"))

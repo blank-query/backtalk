@@ -76,6 +76,7 @@ import audioop
 import json
 import queue
 import struct
+import time
 
 import numpy as np
 import websockets
@@ -205,6 +206,7 @@ class BrowserBridge:
         streaming, but main.py acts on nothing except "start
         listening", and a click on the face also resumes."""
         conn.listening, conn.listen_muted = on, muted and on
+        conn.active = time.monotonic()      # the hands-free idle clock
         if conn.id:
             if on:
                 self._hf_ids.add(conn.id)

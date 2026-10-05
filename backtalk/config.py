@@ -116,6 +116,10 @@ DEFAULTS = {
     # Too short and a mid-thought pause sends half a sentence; longer
     # delays every reply by the difference.
     "open_mic_silence_ms": 1200,
+    # Hands-free switches itself back to push-to-talk after this many
+    # seconds with no conversation (nothing said to it, no press, no
+    # reply in progress), on the local mic and per browser. 0 = never.
+    "hands_free_timeout_s": 120,
     # Resume the previous conversation on launch. OFF by default: a
     # fresh session every launch is the predictable behavior. Set true
     # and backtalk saves the session id after every completed turn
