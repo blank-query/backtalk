@@ -64,6 +64,17 @@ from backtalk.config import CFG, DISCIPLINE
 from backtalk.vlog import log
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
+
+
+def _sentence_end(buf: str):
+    """The first sentence break that isn't inside an unfinished <<tag>>: an
+    announcement's text has full stops of its own, and splitting there
+    left the tag in pieces, spoken aloud instead of acted on."""
+    for m in _SENTENCE_END.finditer(buf):
+        head = buf[:m.start()]
+        if head.count("<<") <= head.count(">>"):
+            return m
+    return None
 # <<anything>> is a stage direction: lifted out, never spoken, published on
 # the bus when the audio carrying it starts. Bounded so a runaway model
 # cannot swallow a paragraph into one "tag" (long enough for a phone
@@ -584,7 +595,7 @@ class WarmBrain:
                         if delta.get("type") == "text_delta":
                             buf += delta.get("text", "")
                             while True:
-                                m = _SENTENCE_END.search(buf)
+                                m = _sentence_end(buf)
                                 if not m:
                                     break
                                 sentence, buf = (buf[:m.end()].strip(),
