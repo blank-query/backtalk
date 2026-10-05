@@ -65,12 +65,14 @@ import threading
 from difflib import SequenceMatcher
 import time
 
+import numpy as np
+
 from backtalk import signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, Session, explain_audio_failure, record_held,
                            warm as warm_ears)
-from backtalk.mouth import Mouth
+from backtalk.mouth import DIRECTION_HOOKS, Mouth, synth_stream
 from backtalk.ptt import PTTListener
 from backtalk.vlog import log
 from backtalk.web import BrowserBridge, ListenStream
@@ -950,6 +952,10 @@ async def amain():
         tail_verb, text = trailing_mic_verb(text)
         if tail_verb:
             await run_console(tail_verb, remote_sink)
+        # Which device asked, by name, so the agent knows the room.
+        where = bridge.name_of(getattr(remote_sink, "conn_id", None)) if bridge else None
+        if where:
+            text = f"[from {where}] {text}"
         shared = images.pop(getattr(remote_sink, "conn_id", None), None)
         if shared:
             text = ("[The user shared an image with this message; view it "
@@ -1001,6 +1007,41 @@ async def amain():
                 f.write(data)
             images.setdefault(conn.id, []).append(p)
             log(f"[web] image from {str(conn.id)[:8]}: {p} ({len(data) // 1024} KB)")
+
+        def _announce(directions, asker):
+            """<<announce {"to": name, "text": ...}>>: a chime, then the
+            text in this voice, on that device only. Not delivered (no
+            such device, or it isn't connected): the agent is told."""
+            for d in directions:
+                if not d.startswith("announce "):
+                    continue
+                try:
+                    a = json.loads(d[9:])
+                    conn = bridge.find(str(a["to"]))
+                    if conn is None:
+                        names = ", ".join(v.get("name", "?") for v in bridge.devices().values())
+                        raise LookupError(f"{a['to']!r} isn't connected (devices: {names})")
+                except Exception as e:
+                    log(f"[announce] not delivered: {e}")
+                    loop.call_soon_threadsafe(
+                        brain.ask, f"[Announcement not delivered: {e}]", asker)
+                    continue
+                threading.Thread(target=_play_announcement, daemon=True,
+                                 args=(conn, str(a.get("text") or ""))).start()
+
+        def _play_announcement(conn, text: str):
+            sink = bridge.make_sink(conn)
+            chunks = list(synth_stream(text))
+            rate = chunks[0][0]
+            t = np.arange(int(rate * 0.14)) / rate          # the chime: two soft tones
+            env = np.sin(np.pi * t / t[-1])
+            chime = np.concatenate([np.sin(2 * np.pi * f * t) * env for f in (880, 1320)]
+                                   + [np.zeros(int(rate * 0.2))])
+            sink(rate, (chime * 9000).astype(np.int16))
+            for r, pcm in chunks:
+                sink(r, pcm)
+            sink.reply_done()
+            log(f"[announce] to {bridge.name_of(conn.id)}: {text[:120]}")
 
         def _on_phone_result(conn, text: str):
             """A phone command's outcome the agent needs (a failure, a
@@ -1124,6 +1165,9 @@ async def amain():
             bridge.on_listen = _hf_listen
             bridge.on_image = _on_image
             bridge.on_phone_result = _on_phone_result
+            bridge.devices_file = os.path.join(CFG["agent_dir"], ".backtalk", "devices.json")
+            os.makedirs(os.path.dirname(bridge.devices_file), exist_ok=True)
+            DIRECTION_HOOKS.append(_announce)
             brain.remote_sink = bridge.make_broadcast_sink()
             asyncio.create_task(bridge.serve())
         ptt = PTTListener(CFG["ptt_key"])

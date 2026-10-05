@@ -360,6 +360,11 @@ def _stream_piper(text: str):
             yield rate, a
 
 
+# Called with (directions, asking sink) as a sentence starts playing, for
+# directions handled outside mouth (main.py's announcements).
+DIRECTION_HOOKS: list = []
+
+
 def _phone_frames(directions):
     """The <<phone {...}>> directions as (json text, frame or the error).
     A "voice" command carries its recording: `say`, spoken in this voice,
@@ -630,6 +635,11 @@ class Mouth:
                     else:
                         send(frame)
                         log(f"[phone] sent: {d[:200]}")
+                for hook in DIRECTION_HOOKS:
+                    try:
+                        hook(directions, remote_sink)
+                    except Exception as e:
+                        log(f"[mouth] direction hook failed: {e}")
 
             def _write(pcm):
                 for i in range(0, len(pcm), block):

@@ -35,6 +35,9 @@ Wire protocol, deliberately tiny:
                                              DEVICE_ID), used for
                                              Conn.id and per-device
                                              routing.
+                                             An optional "model" (the
+                                             app's phone model) names a
+                                             new device; see saw().
   text frame  {"type": "press"}             browser -> server (queue)
   text frame  {"type": "interrupt_press"}   browser -> server (the
                                              Interrupt button: stop the
@@ -93,6 +96,7 @@ import asyncio
 import audioop
 import base64
 import json
+import os
 import queue
 import struct
 import time
@@ -147,6 +151,7 @@ class Conn:
                 kind = data.get("type")
                 if kind == "hello":
                     self.id = data.get("device_id") or self.id
+                    self.bridge.saw(self, data.get("model"))
                     if self.id in self.bridge._hf_ids:
                         self.bridge.set_listening(self, True)
                 elif kind == "press":
@@ -199,6 +204,7 @@ class BrowserBridge:
         self.on_listen = None   # main.py: start a listener for a Conn
         self.on_image = None    # main.py: (Conn, jpeg bytes), a shared picture
         self.on_phone_result = None   # main.py: (Conn, text) from a phone command
+        self.devices_file = None      # main.py: the device names (see saw)
 
     async def serve(self):
         self._loop = asyncio.get_running_loop()
@@ -258,6 +264,44 @@ class BrowserBridge:
             f" for {str(conn.id)[:8]}")
         if on and self.on_listen is not None:
             self.on_listen(conn)
+
+    # ---- device names: "the kitchen" is the Echo Show. A JSON file of
+    # {device_id: {"name", "model", "seen"}}; a new device is named after
+    # its model (or "browser xxxx"), and the agent renames one by editing
+    # the file. Read fresh each time, so its edits apply at once.
+
+    def devices(self) -> dict:
+        try:
+            with open(self.devices_file) as f:
+                return json.load(f)
+        except (OSError, TypeError, ValueError):
+            return {}
+
+    def saw(self, conn: Conn, model: str | None):
+        if not (self.devices_file and conn.id):
+            return
+        devs = self.devices()
+        d = devs.setdefault(conn.id, {"name": model or f"browser {conn.id[:4]}"})
+        if model:
+            d["model"] = model
+        d["seen"] = time.strftime("%Y-%m-%d %H:%M")
+        tmp = self.devices_file + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(devs, f, indent=1)
+            os.replace(tmp, self.devices_file)
+        except OSError as e:
+            log(f"[web] device list not saved: {e}")
+
+    def name_of(self, conn_id) -> str | None:
+        return self.devices().get(conn_id, {}).get("name") if conn_id else None
+
+    def find(self, name: str) -> Conn | None:
+        """The live connection of the device with this name (any case)."""
+        ids = {i for i, d in self.devices().items()
+               if str(d.get("name", "")).casefold() == name.strip().casefold()}
+        return next((c for c in list(self._conns)
+                     if c.id in ids and not c.disconnected), None)
 
     async def stop(self):
         if self._server is not None:
