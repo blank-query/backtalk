@@ -52,8 +52,8 @@ Wire protocol, deliberately tiny:
                                              listening"); hands-free
                                              comes back
   text frame  {"type": "hands_free",        browser -> server: switch
-               "on": b}                      hands-free on or off for this
-                                             tab, silently
+               "on": b, "muted": b}          hands-free on, paused, or off
+                                             for this tab, silently
   text frame  {"type": "listen", "on": b,   server -> browser: hands-
                "muted": b}
                                              free on or off for that
@@ -142,9 +142,11 @@ class Conn:
                 elif kind == "unmute" and self.listen_muted:
                     self.bridge.set_listening(self, True)
                 elif kind == "hands_free":
-                    # a silent switch from the client (the app's double
-                    # tap, its assistant gesture): no spoken confirmation
-                    self.bridge.set_listening(self, bool(data.get("on")))
+                    # a silent switch from the client's own controls (the
+                    # app's taps, its assistant gesture): no spoken line;
+                    # on + muted = paused
+                    self.bridge.set_listening(self, bool(data.get("on")),
+                                              muted=bool(data.get("muted")))
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
