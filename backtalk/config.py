@@ -153,7 +153,7 @@ DEFAULTS = {
     "stt_compute": "int8",
     # Optional: 1 = greedy decoding (faster, for small hardware; the
     # default 0 leaves faster-whisper's own beam of 5), and words to
-    # bias recognition toward, space-separated ("Jarvis home server").
+    # bias recognition toward, space-separated ("Jarvis Hexbox").
     "stt_beam_size": 0,
     "stt_hotwords": "",
     # "whisper" (default) or "moonshine": Moonshine v2 streams, so the
@@ -170,15 +170,16 @@ DEFAULTS = {
     # 1.8 s and finished ~1 s after you stop).
     "moonshine_refresh": 1.0,
     # How hard stt_hotwords pull (streaming models only). Measured with
-    # "Jarvis home server": 5 fixed the name with no false hits, 10 turned
-    # "pine nuts" into it, 20 produced nothing but the hotwords.
+    # a house name: 5 fixed it with no false hits, 10 also rewrote an
+    # ordinary phrase that sounded like it, 20 produced nothing but the
+    # hotwords.
     "moonshine_keyterm_boost": 5,
     # Debugging: a folder to save every utterance's audio to (one wav
     # each, named by time), so a mishearing can be replayed. "" = off.
     "stt_save_dir": "",
     # Fixes for words the speech engine reliably gets wrong: [regex,
     # replacement] pairs, case-insensitive, applied to every transcript.
-    # e.g. [["\\bpine[- ]?(ass|nas|uzz)\\b", "home server"]]
+    # e.g. [["\\bhex[- ]?(box|bucks)\\b", "Hexbox"]]
     "stt_corrections": [],
     # The microphone to record from, matched by NAME. "" means whatever
     # the OS calls the default input, which is right on most machines.

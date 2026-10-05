@@ -352,8 +352,8 @@ def transcribe(pcm: np.ndarray, vad: bool = False) -> str:
         # off), and no window is conditioned on the last one's words.
         # Optional tuning, passed only when set: stt_beam_size 1 is ~30%
         # faster at the same accuracy on a Pi 5 (base.en, measured);
-        # stt_hotwords nudges recognition toward names ("home server" was
-        # heard as "Piners").
+        # stt_hotwords nudges recognition toward names (a house name was
+        # heard as an ordinary word without it).
         extra = {k: CFG[c] for k, c in (("beam_size", "stt_beam_size"),
                                         ("hotwords", "stt_hotwords"))
                  if CFG.get(c)}
