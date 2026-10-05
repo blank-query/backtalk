@@ -984,6 +984,21 @@ async def amain():
         hf_q: "asyncio.Queue" = asyncio.Queue()
         hf_fut: asyncio.Future | None = None
 
+        def _capturing(conn, on):
+            """An open mic started or stopped capturing an utterance
+            (listener thread). The tab hears about it, so its face shows
+            the listening rings in hands-free too, and the bus gets one
+            flag across every open mic, for restarts to wait on."""
+            if conn is None:
+                _MIC["capturing"] = on
+            else:
+                conn.capturing = on
+                asyncio.run_coroutine_threadsafe(conn.ws.send(json.dumps(
+                    {"type": "capturing", "on": on})), loop)
+            conns = list(bridge._conns) if bridge is not None else []
+            signals.set_capturing(bool(_MIC.get("capturing"))
+                                  or any(getattr(c, "capturing", False) for c in conns))
+
         def _hf_listen(conn):
             t = getattr(conn, "hf_thread", None)
             if t is not None and t.is_alive():
@@ -1003,7 +1018,7 @@ async def amain():
                 while not stop():
                     try:
                         text = hf_ears.listen_once(stream=stream, gate=gate,
-                                                   busy=lambda b: setattr(conn, "capturing", b),
+                                                   busy=lambda b: _capturing(conn, b),
                                                    abort=stop)
                     except Exception as e:
                         log(f"[web] hands-free listener failed: {e!r}")
@@ -1128,7 +1143,7 @@ async def amain():
                     mic_fut = loop.run_in_executor(
                         None, lambda g=g: (g, ears.listen_once(
                             gate=mic_gate,
-                            busy=lambda b: _MIC.__setitem__("capturing", b),
+                            busy=lambda b: _capturing(None, b),
                             abort=lambda: _MIC["gen"] != g)))
                 waiters.add(mic_fut)
             if bridge is not None:

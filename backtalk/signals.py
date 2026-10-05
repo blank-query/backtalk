@@ -27,6 +27,7 @@ is the whole integration surface:
                       written when show_usage is on
   .voice_mic_mode     ptt | open | paused (paused wins over open, open
                       over ptt, across the local mic and every tab)
+  .voice_capturing    1 while an open mic is mid-utterance, else 0
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
@@ -59,6 +60,7 @@ _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 _TASKS_FILE = os.path.join(_DIR, ".voice_tasks")
 _ACTIVE_CONN_FILE = os.path.join(_DIR, ".voice_active_conn")
 _MIC_MODE_FILE = os.path.join(_DIR, ".voice_mic_mode")
+_CAPTURING_FILE = os.path.join(_DIR, ".voice_capturing")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -84,6 +86,17 @@ def set_state(name: str):
                 f.write(name)
         except OSError:
             pass
+
+
+def set_capturing(on: bool):
+    """1 while any open mic (local or a browser's hands-free) is mid-
+    utterance, else 0: for a restart to wait on, so it never cuts
+    someone off mid-sentence. Never raises."""
+    try:
+        with open(_CAPTURING_FILE, "w") as f:
+            f.write("1" if on else "0")
+    except OSError:
+        pass
 
 
 def set_mic_mode(mode: str):
