@@ -291,21 +291,34 @@ class BrowserBridge:
         left for the caller to handle."""
         loop = self._loop
 
+        def live():
+            """The connection to send to NOW: this one, or, if its tab was
+            reloaded, the new connection with the same device id, so a
+            reply carries on mid-sentence instead of going to a dead one."""
+            if not conn.disconnected:
+                return conn
+            for c in list(self._conns):
+                if c.id is not None and c.id == conn.id and not c.disconnected:
+                    return c
+            return None
+
         def _sink(rate: int, pcm: np.ndarray):
-            if conn.disconnected or loop is None:
+            c = live()
+            if c is None or loop is None:
                 return
             try:
                 frame = struct.pack("<I", rate) + pcm.tobytes()
-                asyncio.run_coroutine_threadsafe(conn.ws.send(frame), loop)
+                asyncio.run_coroutine_threadsafe(c.ws.send(frame), loop)
             except Exception:
                 pass
 
         def _reply_done():
-            if conn.disconnected or loop is None:
+            c = live()
+            if c is None or loop is None:
                 return
             try:
                 asyncio.run_coroutine_threadsafe(
-                    conn.ws.send(json.dumps({"type": "reply_done"})), loop)
+                    c.ws.send(json.dumps({"type": "reply_done"})), loop)
             except Exception:
                 pass
 
@@ -313,11 +326,12 @@ class BrowserBridge:
             """An interrupt: tell the browser to discard every chunk
             already sent but not yet played — mirrors mouth.shut_up()
             on this end."""
-            if conn.disconnected or loop is None:
+            c = live()
+            if c is None or loop is None:
                 return
             try:
                 asyncio.run_coroutine_threadsafe(
-                    conn.ws.send(json.dumps({"type": "stop"})), loop)
+                    c.ws.send(json.dumps({"type": "stop"})), loop)
             except Exception:
                 pass
 
@@ -329,7 +343,7 @@ class BrowserBridge:
         # brain.py's _ask_queue for a while before its turn starts,
         # and the tab it belongs to may have long since closed by
         # then; see is_live's use there.
-        _sink.is_live = lambda: not conn.disconnected
+        _sink.is_live = lambda: live() is not None
         return _sink
 
     def make_broadcast_sink(self):
