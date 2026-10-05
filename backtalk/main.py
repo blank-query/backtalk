@@ -1015,14 +1015,23 @@ async def amain():
             stop = lambda: not conn.listening or conn.disconnected
 
             def work():
-                while not stop():
+                # ONE listener per tab for its whole connection, idling
+                # while hands-free is off. One that exited on "off" could
+                # still be shutting down when an "on" came straight after
+                # (a triple click, 2026-10-04), which then saw it alive,
+                # started nothing, and left the tab unheard.
+                while not conn.disconnected:
+                    if not conn.listening:
+                        time.sleep(0.1)
+                        continue
                     try:
                         text = hf_ears.listen_once(stream=stream, gate=gate,
                                                    busy=lambda b: _capturing(conn, b),
                                                    abort=stop)
                     except Exception as e:
                         log(f"[web] hands-free listener failed: {e!r}")
-                        return
+                        time.sleep(1)
+                        continue
                     if text and not stop():
                         loop.call_soon_threadsafe(hf_q.put_nowait,
                                                   (conn, text))
