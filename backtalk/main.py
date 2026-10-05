@@ -78,6 +78,8 @@ from backtalk.vlog import log
 from backtalk.web import BrowserBridge, ListenStream
 
 NAME = CFG["name"]
+# When the last spoken (not typed) question came in, any device; see handle().
+_LAST_SPOKEN = [0.0]
 QUIT_PHRASES = CFG["quit_phrases"]
 
 # ---- THE SPOKEN PERMISSION GATE (permission_mode "ask", the default).
@@ -877,7 +879,8 @@ async def amain():
         signals.set_state("idle")
 
     async def handle(text: str, spoke_from: float | None = None,
-                     interrupt: bool = True, remote_sink=None) -> bool:
+                     interrupt: bool = True, remote_sink=None,
+                     typed: bool = False) -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
         told apart from speech that began before the ask even existed.
@@ -954,17 +957,27 @@ async def amain():
         tail_verb, text = trailing_mic_verb(text)
         if tail_verb:
             await run_console(tail_verb, remote_sink)
-        # Which device asked, by name, so the agent knows the room.
+        # Which device asked, by name, so the agent knows the room; and
+        # whether it was typed, with how long since anyone last spoke, so
+        # the agent can judge whether to answer out loud (see <<quiet>>).
         where = bridge.name_of(getattr(remote_sink, "conn_id", None)) if bridge else None
-        if where:
-            text = f"[from {where}] {text}"
+        tags = [f"from {where}"] if where else []
+        if typed:
+            ago = time.monotonic() - _LAST_SPOKEN[0] if _LAST_SPOKEN[0] else None
+            tags.append("typed; " + (f"last spoken exchange {ago / 60:.0f} min ago"
+                                     if ago is not None else "nothing spoken this session"))
+        else:
+            _LAST_SPOKEN[0] = time.monotonic()
+        if tags:
+            text = f"[{', '.join(tags)}] {text}"
         shared = images.pop(getattr(remote_sink, "conn_id", None), None)
         if shared:
             text = ("[The user shared an image with this message; view it "
                     f"with the Read tool: {', '.join(shared)}] {text}")
             remote_sink.send({"type": "image_used"})
         signals.set_state("thinking")
-        signals.static_start()
+        if not typed:          # typing usually means keep it quiet
+            signals.static_start()
         _deny_pending()
         brain.ask(text, remote_sink=remote_sink)
         return True
@@ -1257,7 +1270,7 @@ async def amain():
                         continue
                     await handle(text, spoke_from=time.monotonic(),
                                  interrupt=False,
-                                 remote_sink=bridge.make_sink(conn))
+                                 remote_sink=bridge.make_sink(conn), typed=True)
                     continue
                 if conn.disconnected or not conn.listening:
                     continue

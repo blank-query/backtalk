@@ -415,6 +415,7 @@ class WarmBrain:
         pending: list[str] = []
         buf = ""
         turn_sink = None   # resolved at this turn's first content, below
+        quiet = False      # <<quiet>>: this reply is text only (a typed question)
         # The turn's content blocks in order, [type, chars of thinking].
         # Logged once per turn: an answer written only as reasoning (a
         # thinking block, then a tool call, no text) is never spoken, and
@@ -442,13 +443,31 @@ class WarmBrain:
                 batch = []
 
         def emit(raw: str):
-            nonlocal first, batch, pending, turn_sink
+            nonlocal first, batch, pending, turn_sink, quiet
             found = _DIRECTION_TAG.findall(raw)
             if found:
                 pending += [d.strip() for d in found if d.strip()]
+            if "quiet" in pending:
+                quiet = True
+                pending = [d for d in pending if d != "quiet"]
             raw = _DIRECTION_TAG.sub(" ", raw)
             s = " ".join(raw.replace("`", "").split()).strip()
             if not s or not self.mouth:
+                return
+            if quiet:
+                # Text only: the asking device's terminal gets it, nothing
+                # is spoken; its tags still fire (see mouth._run).
+                if first:
+                    turn_sink = self._current_asker or self.remote_sink
+                    self._ask_t0 = None
+                    signals.static_stop()
+                log(f"[Jarvis] (quiet) {s}"
+                    + (f"  <directions: {pending}>" if pending else ""))
+                _line(turn_sink, s)
+                if pending:
+                    self.mouth.say_chunk("", pending, turn_sink)
+                pending = []
+                first = False
                 return
             if first:
                 # _current_asker is the exact remote_sink whose ask()
@@ -481,7 +500,7 @@ class WarmBrain:
                     flush()
 
         def end_turn():
-            nonlocal first, batch, pending, buf
+            nonlocal first, batch, pending, buf, quiet
             tail = buf.strip()
             buf = ""
             if tail:
@@ -491,12 +510,13 @@ class WarmBrain:
                 # A tag after the last sentence: nothing left to carry it,
                 # so it goes alone and fires when the speech before it ends.
                 self.mouth.say_chunk("", pending, self._current_asker if first else turn_sink)
-            if first:
-                # Zero sentences yielded (brain error / empty turn): park
-                # the bus rather than leave it on "thinking" forever.
+            if first or quiet:
+                # Zero sentences yielded (brain error / empty turn), or a
+                # text-only reply: park the bus rather than leave it on
+                # "thinking" forever.
                 signals.static_stop()
                 signals.set_state("idle")
-            first, batch, pending = True, [], []
+            first, batch, pending, quiet = True, [], [], False
 
         stream = self._client.receive_messages().__aiter__()
         nxt = asyncio.ensure_future(stream.__anext__())
