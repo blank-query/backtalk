@@ -639,7 +639,8 @@ async def amain():
             resume_id = None
 
     mouth = Mouth()
-    ears = Ears(silence_ms=int(CFG.get("open_mic_silence_ms") or 480))
+    ears = Ears(aggressiveness=int(CFG.get("open_mic_vad_level", 2)),
+                silence_ms=int(CFG.get("open_mic_silence_ms") or 480))
     # can_use_tool needs brain.remote_sink, but brain needs can_use_tool
     # at construction — broken by constructing without it, then setting
     # it once the gate has a real brain to close over.
@@ -988,6 +989,7 @@ async def amain():
             if t is not None and t.is_alive():
                 return
             stream, hf_ears = ListenStream(conn), Ears(
+                aggressiveness=int(CFG.get("open_mic_vad_level", 2)),
                 silence_ms=int(CFG.get("open_mic_silence_ms") or 480))
             # Closed only during this tab's own press. The tab itself
             # goes deaf while it plays the reply or the thinking sound
@@ -1001,6 +1003,7 @@ async def amain():
                 while not stop():
                     try:
                         text = hf_ears.listen_once(stream=stream, gate=gate,
+                                                   on_speech=lambda: setattr(conn, "active", time.monotonic()),
                                                    abort=stop)
                     except Exception as e:
                         log(f"[web] hands-free listener failed: {e!r}")
@@ -1120,6 +1123,7 @@ async def amain():
                     mic_fut = loop.run_in_executor(
                         None, lambda g=g: (g, ears.listen_once(
                             gate=mic_gate,
+                            on_speech=lambda: _MIC.__setitem__("active", time.monotonic()),
                             abort=lambda: _MIC["gen"] != g)))
                 waiters.add(mic_fut)
             if bridge is not None:

@@ -116,6 +116,11 @@ DEFAULTS = {
     # Too short and a mid-thought pause sends half a sentence; longer
     # delays every reply by the difference.
     "open_mic_silence_ms": 1200,
+    # How strict the open mic's speech detector is, 0-3 (webrtcvad).
+    # Higher rejects more background noise as "not speech", so a
+    # sentence ends when you stop instead of running on through the
+    # noise; too high can clip soft speech.
+    "open_mic_vad_level": 2,
     # Hands-free switches itself back to push-to-talk after this many
     # seconds with no conversation (nothing said to it, no press, no
     # reply in progress), on the local mic and per browser. 0 = never.
