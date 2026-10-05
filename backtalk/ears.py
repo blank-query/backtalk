@@ -383,12 +383,25 @@ def _moonshine():
                 log(f"[ears] loading moonshine {arch.name.lower()}...")
                 path, arch = mv.get_model_for_language(
                     "en", arch, cache_root=CFG.get("moonshine_cache") or None)
-                _moon = mv.Transcriber(path, arch, update_interval=0.3)
+                terms = (CFG.get("stt_hotwords") or "").split()
+                opts = ({"keyterm_boost": str(CFG.get("moonshine_keyterm_boost") or 5)}
+                        if terms else {})
+                _moon = mv.Transcriber(path, arch, options=opts,
+                                       update_interval=_refresh())
+                if terms:
+                    try:
+                        _moon.set_keyterms(terms)
+                    except Exception as e:   # non-streaming models refuse
+                        log(f"[ears] moonshine hotwords off ({e})")
                 log("[ears] moonshine ready")
             except Exception as e:
                 log(f"[ears] moonshine unavailable ({e!r}); using whisper")
                 _moon = False
     return _moon or None
+
+
+def _refresh() -> float:
+    return float(CFG.get("moonshine_refresh") or 1.0)
 
 
 def _has_speech(pcm: np.ndarray) -> bool:
@@ -411,7 +424,7 @@ class Session:
         self._q = None
         if self._moon is not None:
             with _moon_lock:
-                self._stream = self._moon.create_stream(update_interval=0.3)
+                self._stream = self._moon.create_stream(update_interval=_refresh())
                 self._stream.start()
             self._q = queue.Queue()
             self._worker = threading.Thread(target=self._feed, daemon=True)

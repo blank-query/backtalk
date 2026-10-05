@@ -160,6 +160,15 @@ DEFAULTS = {
     "stt_engine": "whisper",
     "moonshine_model": "SMALL_STREAMING",
     "moonshine_cache": "",
+    # Seconds between the running transcript's refreshes while you
+    # talk; each refresh redoes work, so bigger models want it slower
+    # (medium on a Pi 5: 0.5 fell 3.7 s behind live speech, 1.0 kept to
+    # 1.8 s and finished ~1 s after you stop).
+    "moonshine_refresh": 1.0,
+    # How hard stt_hotwords pull (streaming models only). Measured with
+    # "Jarvis home server": 5 fixed the name with no false hits, 10 turned
+    # "pine nuts" into it, 20 produced nothing but the hotwords.
+    "moonshine_keyterm_boost": 5,
     # The microphone to record from, matched by NAME. "" means whatever
     # the OS calls the default input, which is right on most machines.
     #
