@@ -393,9 +393,15 @@ class ListenStream:
             try:
                 chunk = self.conn._listen_q.get(timeout=0.1)
             except queue.Empty:
-                if len(self._buf) == 0:
-                    return np.zeros((n, 1), dtype=np.int16), False
-                continue
+                # A gap: hand back what's here padded with silence. Waiting
+                # for the rest froze the listener mid-utterance when the tab
+                # stopped streaming (switched to push to talk), so its
+                # capturing flag (the listening rings, the quiet-restart
+                # check) never cleared, and abort was never checked.
+                out = np.zeros(n, dtype=np.int16)
+                out[:len(self._buf)] = self._buf
+                self._buf = self._buf[:0]
+                return out.reshape(-1, 1), False
             if len(chunk) < 4:
                 continue
             rate = struct.unpack_from("<I", chunk, 0)[0]
