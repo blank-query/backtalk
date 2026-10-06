@@ -653,7 +653,7 @@ class WarmBrain:
                     self.bus.set_active_conn(None)
                     if was_discarding:
                         buf = ""
-                        first, batch, pending = True, [], []
+                        first, batch, pending, quiet = True, [], [], False
                         # tally/remember still happen: the turn really
                         # did run and spend usage, it just wasn't spoken.
                         self._tally(msg)
