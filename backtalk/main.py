@@ -909,6 +909,7 @@ async def amain():
     # Its face signals go to that device's own channel (signals.DeviceBus).
     sessions: dict = {}           # device id -> WarmBrain
     handed_back: dict = {}        # device id -> a note for the main session's next message from it
+    hf_locked: dict = {}          # device id -> was it hands-free before a session locked it on
 
     def brain_for(x):
         """The session that owns this device (a conn, a sink, or an id),
@@ -1154,7 +1155,7 @@ async def amain():
                 loop.call_soon_threadsafe(brain_for(asker).ask, f"[Enrollment not started: {e!r}]", asker)
 
         def _session(arg: str, asker):
-            """<<session {"purpose": ..., "brief": ...}>> from the main
+            """<<session {"purpose", "brief", "hands_free"?}>> from the main
             session: a dedicated session takes over the asking device.
             <<session end>> from that dedicated session: it hands the
             device back. Failures go back to whoever asked."""
@@ -1172,6 +1173,11 @@ async def amain():
                         await b.stop()
                         b.mouth.shutdown()
                         b.bus.close()
+                        was = hf_locked.pop(cid, None)
+                        conn = next((c for c in list(bridge._conns) if c.id == cid
+                                     and not c.disconnected), None)
+                        if was is not None and conn is not None and not was:
+                            bridge.set_listening(conn, False)
                         return
                     a = json.loads(arg)
                     conn = next((c for c in list(bridge._conns) if c.id == cid
@@ -1191,7 +1197,13 @@ async def amain():
                     b.remote_sink = bridge.make_sink(conn)
                     await b.start()
                     sessions[cid] = b
-                    log(f"[session] {a.get('purpose')!r} started on {name}")
+                    if a.get("hands_free"):
+                        # hands busy (cooking): open mic, no idle timeout,
+                        # until the session ends and the old mode returns
+                        hf_locked[cid] = bool(conn.listening and not conn.listen_muted)
+                        bridge.set_listening(conn, True)
+                    log(f"[session] {a.get('purpose')!r} started on {name}"
+                        + (" (hands-free locked on)" if cid in hf_locked else ""))
                     b.ask(f"[Dedicated session started: {a.get('purpose')}. Brief from the "
                           f"main session: {a.get('brief', '')}]", bridge.make_sink(conn))
                 except Exception as e:
@@ -1344,6 +1356,7 @@ async def amain():
             # as an empty capture, 30 s at most) can't keep it on forever.
             for c in conns:
                 if c.listening and not getattr(c, "capturing", False) \
+                        and c.id not in hf_locked \
                         and now - getattr(c, "active", now) > limit:
                     bridge.set_listening(c, False)
                     log(f"[web] hands-free timed out for {str(c.id)[:8]}")
