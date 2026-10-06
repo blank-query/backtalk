@@ -89,8 +89,11 @@ Wire protocol, deliberately tiny:
                                              bridge relays the frames to
                                              the other end, untranscribed
   text frame  {"type": "hangup"}            client -> server: end the call
-                                             (so does a press, or either
-                                             end disconnecting)
+                                             (so does either end
+                                             disconnecting, or a press on a
+                                             device no session owns; on an
+                                             owned one a press talks to its
+                                             agent, muted to the far end)
   text frame  {"type": "listen", "on": b,   server -> browser: hands-
                "muted": b}
                                              free on or off for that
@@ -173,6 +176,10 @@ class Conn:
         self.listening = False   # hands-free: frames outside a press
         self.listen_muted = False   # paused: hearing only "start listening"
         self.call: Call | None = None   # an intercom call: audio relays, untranscribed
+        # Agent speech for this device while it's on a call, at RATE, waiting
+        # to be mixed into the far end's audio (Bridge._mix); see make_sink.
+        self.overlay: "collections.deque[np.ndarray]" = collections.deque()
+        self.relayed_at = 0.0   # when call audio last went to this device
         # Read from a worker thread (ListenStream), hence queue.Queue.
         # Bounded: a stalled listener drops audio, never memory.
         self._listen_q: "queue.Queue[bytes]" = queue.Queue(maxsize=500)
@@ -184,7 +191,9 @@ class Conn:
         try:
             async for msg in self.ws:
                 if isinstance(msg, (bytes, bytearray)):
-                    if self.call is not None:
+                    # A held press wins over a call (talking to the agent
+                    # on a device a session owns; muted to the far end).
+                    if self.call is not None and not self.recording:
                         self.bridge._call_audio(self, bytes(msg))
                     elif self.recording:
                         await self._frames.put(bytes(msg))
@@ -211,7 +220,11 @@ class Conn:
                         self.bridge.on_text(self, t)
                     if self.id in self.bridge._hf_ids:
                         self.bridge.set_listening(self, True)
-                elif kind in ("hangup", "press", "interrupt_press") and self.call:
+                elif kind == "hangup" and self.call:
+                    self.bridge.end_call(self.call, "hung up")
+                elif kind in ("press", "interrupt_press") and self.call \
+                        and self.id not in self.bridge.owned:
+                    # no session owns this device: a tap on the orb hangs up
                     self.bridge.end_call(self.call, "hung up")
                 elif kind == "press":
                     self.bridge._on_press(self, interrupt=False)
@@ -404,7 +417,9 @@ class BrowserBridge:
     def _call_audio(self, conn: Conn, frame: bytes):
         call = conn.call
         if call.open:
-            self._send(call.peer(conn), frame)
+            peer = call.peer(conn)
+            peer.relayed_at = time.monotonic()
+            self._send(peer, self._mix(peer, frame))
             return
         if conn is not call.caller or len(frame) < 6:
             return                          # the far end isn't on yet
@@ -416,9 +431,62 @@ class BrowserBridge:
         rate = struct.unpack_from("<I", frame, 0)[0]
         self._send(call.callee, struct.pack("<I", rate) + chime(rate).tobytes())
         self._send(call.callee, {"type": "call", "on": True, "with": self.name_of(conn.id)})
+        call.callee.relayed_at = time.monotonic()
         while call.held:
             self._send(call.callee, call.held.popleft())
         log(f"[call] {self.name_of(conn.id)} -> {self.name_of(call.callee.id)}: connected")
+
+    # ---- the agent talking over a call: its speech for a device on a
+    # call is queued (Conn.overlay) and mixed into the far end's frames,
+    # the call ducked under it, so a cooking step plays without dropping
+    # the call. When the far end sends nothing (a browser taking turns),
+    # _drain plays the speech on its own.
+
+    def _overlay_take(self, conn: Conn, n: int) -> np.ndarray:
+        out, got = [], 0
+        while conn.overlay and got < n:
+            a = conn.overlay.popleft()
+            if got + len(a) > n:
+                conn.overlay.appendleft(a[n - got:])
+                a = a[:n - got]
+            out.append(a)
+            got += len(a)
+        return np.concatenate(out) if out else np.zeros(0, np.int16)
+
+    def _mix(self, conn: Conn, frame: bytes) -> bytes:
+        if not conn.overlay or len(frame) < 6:
+            return frame
+        rate = struct.unpack_from("<I", frame, 0)[0] or RATE
+        call = np.frombuffer(frame[4:len(frame) - (len(frame) - 4) % 2], dtype=np.int16)
+        take = self._overlay_take(conn, max(1, round(len(call) * RATE / rate)))
+        if len(take) != len(call):      # to the call's rate and length
+            take = np.interp(np.linspace(0, len(take) - 1, len(call)),
+                             np.arange(len(take)), take)
+        mixed = np.clip(call * 0.35 + take, -32768, 32767).astype(np.int16)
+        return struct.pack("<I", rate) + mixed.tobytes()
+
+    def overlay_add(self, conn: Conn, rate: int, pcm: np.ndarray):
+        """Speech for a device on a call (from any thread)."""
+        if rate != RATE:
+            pcm = np.interp(np.linspace(0, len(pcm) - 1, round(len(pcm) * RATE / rate)),
+                            np.arange(len(pcm)), pcm).astype(np.int16)
+        conn.overlay.append(pcm)
+        if not getattr(conn, "draining", False):
+            conn.draining = True
+            asyncio.run_coroutine_threadsafe(self._drain(conn), self._loop)
+
+    async def _drain(self, conn: Conn):
+        block = RATE // 10
+        try:
+            while conn.overlay and not conn.disconnected:
+                if time.monotonic() - conn.relayed_at > 0.25:
+                    pcm = self._overlay_take(conn, block)
+                    await conn.ws.send(struct.pack("<I", RATE) + pcm.tobytes())
+                await asyncio.sleep(0.1)
+        except Exception:
+            conn.overlay.clear()
+        finally:
+            conn.draining = False
 
     def _send(self, conn: Conn, obj):
         """One frame (bytes) or message (dict) to a connection, from the loop."""
@@ -509,6 +577,9 @@ class BrowserBridge:
                 return
             if not low and conn.id:
                 self.voice_until[conn.id] = time.monotonic() + len(pcm) / rate + 0.3
+            if c.call is not None and c.call.open:
+                self.overlay_add(c, rate, pcm)     # mixed into the call
+                return
             try:
                 frame = struct.pack("<I", rate) + pcm.tobytes()
                 asyncio.run_coroutine_threadsafe(c.ws.send(frame), loop)
@@ -533,6 +604,10 @@ class BrowserBridge:
             """An interrupt: tell the browser to discard every chunk
             already sent but not yet played — mirrors mouth.shut_up()
             on this end."""
+            c = live()
+            if c is not None and c.call is not None:
+                c.overlay.clear()       # never "stop" a call's own audio
+                return
             _send({"type": "stop"})
 
         _sink.reply_done = _reply_done
