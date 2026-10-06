@@ -1021,11 +1021,12 @@ async def amain():
             text = ("[The user shared an image with this message; view it "
                     f"with the Read tool: {', '.join(shared)}] {text}")
             remote_sink.send({"type": "image_used"})
-        signals.set_state("thinking")
+        b = brain_for(remote_sink)     # its own face channel if a session owns the device
+        b.bus.set_state("thinking")
         if not typed:          # typing usually means keep it quiet
-            signals.static_start()
+            b.bus.static_start()
         _deny_pending()
-        brain_for(remote_sink).ask(text, remote_sink=remote_sink)
+        b.ask(text, remote_sink=remote_sink)
         return True
 
     try:
@@ -1127,7 +1128,10 @@ async def amain():
                         f"{enroll['s']:.0f} s of speech on this device]", bridge.make_sink(conn))
                 return f"{enroll['name']} (enrolling)"
             if owner:
-                if e is not None:
+                # Learn only a voice that already matches the owner (from an
+                # enrollment, or earlier matches): phones get handed around,
+                # and someone else's voice must never become the owner's.
+                if e is not None and voiceprint.identify(e, conn.id)[0] == owner:
                     voiceprint.add(owner, conn.id, e)
                 return owner
             if not voiceprint.enabled():
@@ -1283,7 +1287,7 @@ async def amain():
             contact lookup): asked as that device's turn, so the answer
             goes back there."""
             log(f"[phone] result from {str(conn.id)[:8]}: {text[:200]}")
-            signals.set_state("thinking")
+            brain_for(conn).bus.set_state("thinking")
             brain_for(conn).ask(f"[The phone reports back on your last command: {text}]",
                       remote_sink=bridge.make_sink(conn))
 
@@ -1520,7 +1524,7 @@ async def amain():
                 conn.active = time.monotonic()
                 await handle(text, spoke_from=time.monotonic(),
                              interrupt=False,
-                             remote_sink=bridge.make_sink(conn))
+                             remote_sink=bridge.make_sink(conn), who=who)
                 continue
             if typed_fut in done:
                 text = typed_fut.result(); typed_fut = None

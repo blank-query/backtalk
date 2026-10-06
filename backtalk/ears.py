@@ -526,12 +526,17 @@ class Session:
         return _NONSPEECH.sub("", text).strip()
 
 
+def _max_utter() -> float:
+    """Longest open-mic utterance before it's cut (max_utterance_s)."""
+    return float(CFG.get("max_utterance_s") or MAX_UTTER_S)
+
+
 def _log_capture(pcm: np.ndarray, capped: bool):
     """An open-mic utterance's length and how it ended, and when it ran
     to the ceiling, its audio (logs/capped/), to tune the gate on real
     rooms."""
     log(f"[ears] open-mic utterance {len(pcm) / RATE:.1f}s, ended "
-        f"{'at the ' + str(MAX_UTTER_S) + 's ceiling' if capped else 'on silence'}")
+        f"{f'at the {_max_utter():.0f}s ceiling' if capped else 'on silence'}")
     if not capped:
         return
     try:
@@ -616,7 +621,7 @@ class Ears:
                             silence_run = 0
                         else:
                             silence_run += 1
-                        capped = len(frames) * FRAME_MS / 1000 > MAX_UTTER_S
+                        capped = len(frames) * FRAME_MS / 1000 > _max_utter()
                         if silence_run >= self.silence_frames or capped:
                             if speech_total < 8:
                                 # <240ms of actual speech: a noise blip, not
