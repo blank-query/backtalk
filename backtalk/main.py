@@ -1083,6 +1083,8 @@ async def amain():
                     _session(d[8:].strip(), asker)
                 if d.startswith("timers "):
                     _timers(d[7:], asker)
+                if d.startswith("show "):
+                    _show(d[5:].strip().strip('"'), asker)
                 if not d.startswith("announce "):
                     continue
                 try:
@@ -1159,6 +1161,33 @@ async def amain():
             except Exception as e:
                 log(f"[voice] enrollment not started: {e!r}")
                 loop.call_soon_threadsafe(brain_for(asker).ask, f"[Enrollment not started: {e!r}]", asker)
+
+        def _show(arg: str, asker):
+            """<<show path/to/note.md>>: that note, whole, as a full-screen
+            card on the asking device (a recipe, a list); <<show close>>
+            closes it. Only files inside the agent's folders."""
+            send = getattr(asker, "send", None)
+            if send is None:
+                return
+            if arg == "close":
+                send({"type": "show", "close": True})
+                return
+            try:
+                roots = [os.path.realpath(r) for r in [CFG["agent_dir"], *CFG["extra_dirs"]]]
+                path = os.path.realpath(arg if os.path.isabs(arg) else os.path.join(CFG["agent_dir"], arg))
+                if not any(path == r or path.startswith(r + os.sep) for r in roots):
+                    raise PermissionError("outside the agent's folders")
+                with open(path, encoding="utf-8") as f:
+                    text = f.read(200_000)
+                if text.startswith("---"):           # drop the note's frontmatter
+                    end = text.find("\n---", 3)
+                    text = text[end + 4:].lstrip() if end > 0 else text
+                send({"type": "show", "title": os.path.splitext(os.path.basename(path))[0],
+                      "markdown": text})
+                log(f"[show] {os.path.basename(path)} to {bridge.name_of(asker.conn_id)}")
+            except Exception as e:
+                log(f"[show] not shown: {e!r}")
+                loop.call_soon_threadsafe(brain_for(asker).ask, f"[Not shown: {e!r}]", asker)
 
         def _timers(arg: str, asker):
             """<<timers [{"label": ..., "at": <epoch s>, "clock": bool?}, ...]>>:
