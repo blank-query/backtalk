@@ -88,6 +88,12 @@ Wire protocol, deliberately tiny:
                                              and plays what arrives; the
                                              bridge relays the frames to
                                              the other end, untranscribed
+  text frame  {"type": "app_update",        server -> client: a newer app
+               "code": N}                    waits (the hello's "version" was
+                                             older); {"type": "app_get"} back
+                                             asks for it, and it comes as
+                                             {"type": "app_chunk", "data":
+                                             base64, "last": b} frames
   text frame  {"type": "hangup"}            client -> server: end the call
                                              (so does either end
                                              disconnecting, or a press on a
@@ -211,6 +217,7 @@ class Conn:
                 if kind == "hello":
                     self.id = data.get("device_id") or self.id
                     self.bridge.saw(self, data.get("model"))
+                    self.bridge.offer_update(self, data.get("version"))
                     if self.bridge._lines.get(self.id):
                         await self.ws.send(json.dumps(
                             {"type": "lines", "lines": list(self.bridge._lines[self.id])}))
@@ -220,6 +227,8 @@ class Conn:
                         self.bridge.on_text(self, t)
                     if self.id in self.bridge._hf_ids:
                         self.bridge.set_listening(self, True)
+                elif kind == "app_get":
+                    asyncio.ensure_future(self.bridge.send_update(self))
                 elif kind == "hangup" and self.call:
                     self.bridge.end_call(self.call, "hung up")
                 elif kind in ("press", "interrupt_press") and self.call \
@@ -279,6 +288,7 @@ class BrowserBridge:
         self.on_image = None    # main.py: (Conn, jpeg bytes), a shared picture
         self.on_phone_result = None   # main.py: (Conn, text) from a phone command
         self.devices_file = None      # main.py: the device names (see saw)
+        self.update_dir = None        # main.py: where a newer app waits (see offer_update)
         self.on_text = None           # main.py: (Conn, text) typed in the terminal
         # Devices a dedicated session owns (main.py's sessions, by id): the
         # main session's broadcasts skip them, so its replies and stops
@@ -380,6 +390,40 @@ class BrowserBridge:
             os.replace(tmp, self.devices_file)
         except OSError as e:
             log(f"[web] device list not saved: {e}")
+
+    # ---- app updates: the newest Android app waits in update_dir as
+    # app.apk plus version.json {"code": N}. A client whose hello says an
+    # older "version" is offered it; on "app_get" it's sent down the same
+    # socket in base64 chunks ({"type": "app_chunk", "data", "last"}) and
+    # the app installs it. No adb, no cable, no store.
+
+    def _latest(self) -> int:
+        try:
+            with open(os.path.join(self.update_dir, "version.json")) as f:
+                return int(json.load(f)["code"])
+        except (OSError, TypeError, ValueError, KeyError):
+            return 0
+
+    def offer_update(self, conn: Conn, version):
+        if not self.update_dir or version is None:
+            return
+        latest = self._latest()
+        if latest > int(version):
+            self._send(conn, {"type": "app_update", "code": latest})
+            log(f"[app] {self.name_of(conn.id)} has version {version}, offered {latest}")
+
+    async def send_update(self, conn: Conn, chunk: int = 256 * 1024):
+        try:
+            with open(os.path.join(self.update_dir, "app.apk"), "rb") as f:
+                apk = f.read()
+        except (OSError, TypeError) as e:
+            log(f"[app] no update to send: {e}")
+            return
+        for i in range(0, len(apk), chunk):
+            last = i + chunk >= len(apk)
+            await conn.ws.send(json.dumps({"type": "app_chunk", "last": last,
+                                           "data": base64.b64encode(apk[i:i + chunk]).decode()}))
+        log(f"[app] sent {len(apk) // 1024} KB to {self.name_of(conn.id)}")
 
     def name_of(self, conn_id) -> str | None:
         return self.devices().get(conn_id, {}).get("name") if conn_id else None

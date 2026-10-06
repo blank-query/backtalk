@@ -1410,6 +1410,7 @@ async def amain():
             bridge.on_text = lambda conn, t: hf_q.put_nowait(
                 (conn, t, True, bridge.devices().get(conn.id, {}).get("owner")))
             bridge.devices_file = os.path.join(CFG["agent_dir"], ".backtalk", "devices.json")
+            bridge.update_dir = os.path.join(CFG["agent_dir"], ".backtalk", "app")
             os.makedirs(os.path.dirname(bridge.devices_file), exist_ok=True)
             DIRECTION_HOOKS.append(_announce)
             bridge.owned = sessions
