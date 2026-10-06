@@ -74,7 +74,11 @@ Wire protocol, deliberately tiny:
                                              asked as that device's turn
   text frame  {"type": "text", "text": ...}  client -> server: a typed
                                              question (the face's
-                                             terminal), queued like a tap
+                                             terminal), queued like a tap;
+                                             with "spoken": true, words the
+                                             phone transcribed itself (on-
+                                             device push to talk): treated
+                                             as speech, not typing
   text frame  {"type": "line", "who":       server -> client: the
                "you"|"jarvis", "text": ...}  conversation as text, this
                                              device's turns only;
@@ -224,7 +228,9 @@ class Conn:
                 elif kind == "text" and self.bridge.on_text is not None:
                     t = str(data.get("text") or "").strip()[:4000]
                     if t:
-                        self.bridge.on_text(self, t)
+                        # "spoken": the phone transcribed it itself (on-device
+                        # push to talk), so it's speech, not typing
+                        self.bridge.on_text(self, t, bool(data.get("spoken")))
                     if self.id in self.bridge._hf_ids:
                         self.bridge.set_listening(self, True)
                 elif kind == "app_get":

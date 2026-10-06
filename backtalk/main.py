@@ -1436,8 +1436,9 @@ async def amain():
             bridge.on_listen = _hf_listen
             bridge.on_image = _on_image
             bridge.on_phone_result = _on_phone_result
-            bridge.on_text = lambda conn, t: hf_q.put_nowait(
-                (conn, t, True, bridge.devices().get(conn.id, {}).get("owner")))
+            bridge.on_text = lambda conn, t, spoken=False: hf_q.put_nowait(
+                (conn, t, "spoken" if spoken else True,
+                 bridge.devices().get(conn.id, {}).get("owner")))
             bridge.devices_file = os.path.join(CFG["agent_dir"], ".backtalk", "devices.json")
             bridge.update_dir = os.path.join(CFG["agent_dir"], ".backtalk", "app")
             os.makedirs(os.path.dirname(bridge.devices_file), exist_ok=True)
@@ -1520,16 +1521,23 @@ async def amain():
             if hf_fut is not None and hf_fut in done:
                 conn, text, typed, who = hf_fut.result(); hf_fut = None
                 if typed:
-                    # Typed in the face's terminal: no listening checks;
-                    # queued behind a reply like a tap. A quit phrase is
-                    # ignored, as from hands-free (it would hang up every
+                    # Typed in the face's terminal, or ("spoken") transcribed
+                    # on the phone itself for a push to talk: no listening
+                    # checks; queued behind a reply like a tap. A quit phrase
+                    # is ignored, as from hands-free (it would hang up every
                     # device).
                     if any(q in text.lower() for q in QUIT_PHRASES):
                         log("[web] quit phrase typed, ignored")
                         continue
+                    if typed == "spoken":
+                        # the same name fixes the Pi's own transcripts get
+                        for pattern, fix in CFG.get("stt_corrections") or []:
+                            text = re.sub(pattern, fix, text, flags=re.IGNORECASE)
+                        log("[ears] transcribed on the device")
                     await handle(text, spoke_from=time.monotonic(),
                                  interrupt=False,
-                                 remote_sink=bridge.make_sink(conn), typed=True, who=who)
+                                 remote_sink=bridge.make_sink(conn),
+                                 typed=typed is True, who=who)
                     continue
                 if conn.disconnected or not conn.listening:
                     continue
