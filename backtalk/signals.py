@@ -375,11 +375,18 @@ def _dev_update(conn_id: str, **fields):
             pass
 
 
+def set_device_timers(conn_id: str, timers: list):
+    """Timers to show on one device's face: [{label, at (epoch s), clock?}]
+    (clock: show the time of day instead of a countdown, e.g. "eating at").
+    Any device, owned or not; [] clears them. Never raises."""
+    _dev_update(str(conn_id), timers=timers)
+
+
 class DeviceBus:
     def __init__(self, conn_id: str):
         self.conn_id = str(conn_id)
         self._last_wave = 0.0
-        _dev_update(self.conn_id, state="idle", tasks=0)
+        _dev_update(self.conn_id, state="idle", tasks=0, owned=True)
 
     def set_state(self, name: str):
         _dev_update(self.conn_id, state=name)

@@ -1080,6 +1080,8 @@ async def amain():
                     _enroll(d[7:], asker)
                 if d.startswith("session "):
                     _session(d[8:].strip(), asker)
+                if d.startswith("timers "):
+                    _timers(d[7:], asker)
                 if not d.startswith("announce "):
                     continue
                 try:
@@ -1153,6 +1155,16 @@ async def amain():
             except Exception as e:
                 log(f"[voice] enrollment not started: {e!r}")
                 loop.call_soon_threadsafe(brain_for(asker).ask, f"[Enrollment not started: {e!r}]", asker)
+
+        def _timers(arg: str, asker):
+            """<<timers [{"label": ..., "at": <epoch s>, "clock": bool?}, ...]>>:
+            the countdowns the asking device's face shows ([] clears)."""
+            try:
+                items = [{"label": str(t["label"])[:40], "at": float(t["at"]),
+                          "clock": bool(t.get("clock"))} for t in json.loads(arg)][:8]
+                signals.set_device_timers(asker.conn_id, items)
+            except Exception as e:
+                log(f"[timers] ignored: {e!r}")
 
         def _session(arg: str, asker):
             """<<session {"purpose", "brief", "hands_free"?}>> from the main
