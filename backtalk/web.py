@@ -318,6 +318,7 @@ class BrowserBridge:
         self._server = await websockets.serve(handler, host, port,
                                               max_size=16 * 2**20)   # shared pictures
         log(f"[web] browser bridge listening on ws://{host}:{port}")
+        asyncio.ensure_future(self._update_watch())
         await self._server.wait_closed()
 
     def _on_press(self, conn: Conn, interrupt: bool = False):
@@ -405,12 +406,26 @@ class BrowserBridge:
             return 0
 
     def offer_update(self, conn: Conn, version):
-        if not self.update_dir or version is None:
+        """Offer the newer build, once per build per connection (declining
+        isn't nagged; a reconnect asks again)."""
+        if version is not None:
+            conn.version = int(version)
+        if not self.update_dir or getattr(conn, "version", None) is None:
             return
         latest = self._latest()
-        if latest > int(version):
+        if latest > conn.version and getattr(conn, "offered", 0) < latest:
+            conn.offered = latest
             self._send(conn, {"type": "app_update", "code": latest})
-            log(f"[app] {self.name_of(conn.id)} has version {version}, offered {latest}")
+            log(f"[app] {self.name_of(conn.id)} has version {conn.version}, offered {latest}")
+
+    async def _update_watch(self):
+        """A device that stays connected for days (the kitchen) hears about
+        a newly parked build too, within ten minutes."""
+        while True:
+            await asyncio.sleep(600)
+            for c in list(self._conns):
+                if not c.disconnected:
+                    self.offer_update(c, None)
 
     async def send_update(self, conn: Conn, chunk: int = 256 * 1024):
         try:
