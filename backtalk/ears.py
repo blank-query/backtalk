@@ -486,6 +486,7 @@ class Ears:
     def __init__(self, aggressiveness: int = 2, silence_ms: int = 480):
         self.vad = webrtcvad.Vad(aggressiveness)
         self.silence_frames = silence_ms // FRAME_MS
+        self.last_pcm = None     # the last utterance's audio (voiceprints)
 
     def listen_once(self, gate=None, timeout_s: float | None = None,
                     abort=None, stream=None, busy=None) -> str | None:
@@ -554,6 +555,7 @@ class Ears:
                                 if busy: busy(False)
                                 continue
                             text = session.finish(); session = None
+                            self.last_pcm = np.concatenate(frames)
                             words = re.findall(r"[a-z']+", text.lower())
                             if words and all(_WAIL.fullmatch(w) for w in words):
                                 log(f"[ears] ignored a wail: {text[:40]!r}")

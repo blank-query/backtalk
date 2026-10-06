@@ -179,6 +179,14 @@ DEFAULTS = {
     # ordinary phrase that sounded like it, 20 produced nothing but the
     # hotwords.
     "moonshine_keyterm_boost": 5,
+    # Voiceprints (backtalk/voiceprint.py): who is talking on a shared
+    # device. Path to a sherpa-onnx speaker-embedding model, e.g.
+    # nemo_en_titanet_small.onnx from sherpa-onnx's
+    # speaker-recongition-models release (pip install sherpa-onnx);
+    # "" = off. A match needs this cosine score (0.25 kept real voices
+    # apart with room to spare in testing).
+    "voiceprint_model": "",
+    "voiceprint_threshold": 0.25,
     # Debugging: a folder to save every utterance's audio to (one wav
     # each, named by time), so a mishearing can be replayed. "" = off.
     "stt_save_dir": "",

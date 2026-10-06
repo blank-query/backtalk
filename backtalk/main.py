@@ -65,7 +65,7 @@ import threading
 from difflib import SequenceMatcher
 import time
 
-from backtalk import signals
+from backtalk import signals, voiceprint
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, Session, explain_audio_failure, record_held,
@@ -79,6 +79,7 @@ NAME = CFG["name"]
 # When the last spoken (not typed) question came in, any device; see handle().
 _LAST_SPOKEN = [0.0]
 QUIT_PHRASES = CFG["quit_phrases"]
+ENROLL_S = 45      # seconds of speech an <<enroll>> collects before it says done
 
 # ---- THE SPOKEN PERMISSION GATE (permission_mode "ask", the default).
 # When the agent wants a gated tool, the SDK routes the decision here:
@@ -878,7 +879,7 @@ async def amain():
 
     async def handle(text: str, spoke_from: float | None = None,
                      interrupt: bool = True, remote_sink=None,
-                     typed: bool = False) -> bool:
+                     typed: bool = False, who: str | None = None) -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
         told apart from speech that began before the ask even existed.
@@ -960,6 +961,8 @@ async def amain():
         # the agent can judge whether to answer out loud (see <<quiet>>).
         where = bridge.name_of(getattr(remote_sink, "conn_id", None)) if bridge else None
         tags = [f"from {where}"] if where else []
+        if who:
+            tags.append(who)
         if typed:
             ago = time.monotonic() - _LAST_SPOKEN[0] if _LAST_SPOKEN[0] else None
             tags.append("typed; " + (f"last spoken exchange {ago / 60:.0f} min ago"
@@ -1028,6 +1031,8 @@ async def amain():
             for d in directions:
                 if d.startswith("call "):
                     _call(d[5:], asker)
+                if d.startswith("enroll "):
+                    _enroll(d[7:], asker)
                 if not d.startswith("announce "):
                     continue
                 try:
@@ -1043,6 +1048,56 @@ async def amain():
                     continue
                 threading.Thread(target=_play_announcement, daemon=True,
                                  args=(conn, str(a.get("text") or ""))).start()
+
+        def _who(conn, pcm) -> str | None:
+            """Who said this, for the agent's tag: the device's owner on a
+            personal device (its prints are kept too, so they're ready for
+            shared ones), else the voiceprint, else "voice unknown". A clip
+            too short to print goes to whoever spoke last here, within two
+            minutes. While enrolling, every print goes to that person, and
+            the agent hears when enough speech is in. Runs off the loop."""
+            owner = bridge.devices().get(conn.id, {}).get("owner")
+            e = voiceprint.embed(pcm)
+            enroll = getattr(conn, "enroll", None)
+            if enroll and e is not None:
+                voiceprint.add(enroll["name"], conn.id, e)
+                enroll["s"] += len(pcm) / voiceprint.RATE
+                if enroll["s"] >= ENROLL_S:
+                    conn.enroll = None
+                    log(f"[voice] enrolled {enroll['name']} on {bridge.name_of(conn.id)}")
+                    loop.call_soon_threadsafe(
+                        brain.ask, f"[Voice enrollment done: {enroll['name']}, "
+                        f"{enroll['s']:.0f} s of speech on this device]", bridge.make_sink(conn))
+                return f"{enroll['name']} (enrolling)"
+            if owner:
+                if e is not None:
+                    voiceprint.add(owner, conn.id, e)
+                return owner
+            if not voiceprint.enabled():
+                return None
+            last = getattr(conn, "last_who", None)
+            if e is None:
+                return last[0] if last and time.monotonic() - last[1] < 120 else None
+            who, score = voiceprint.identify(e, conn.id)
+            log(f"[voice] {who or 'unknown'} ({score:.2f}) on {bridge.name_of(conn.id)}")
+            if who:
+                conn.last_who = (who, time.monotonic())
+            return who or "voice unknown"
+
+        def _enroll(arg: str, asker):
+            """<<enroll {"name": ...}>>: this device's next ENROLL_S
+            seconds of speech are that person's voiceprints."""
+            try:
+                name = str(json.loads(arg)["name"]).strip()
+                conn = next(c for c in list(bridge._conns) if c.id is not None
+                            and c.id == getattr(asker, "conn_id", None) and not c.disconnected)
+                if not voiceprint.enabled():
+                    raise RuntimeError("voiceprints are off (no voiceprint_model)")
+                conn.enroll = {"name": name, "s": 0.0}
+                log(f"[voice] enrolling {name} on {bridge.name_of(conn.id)}")
+            except Exception as e:
+                log(f"[voice] enrollment not started: {e!r}")
+                loop.call_soon_threadsafe(brain.ask, f"[Enrollment not started: {e!r}]", asker)
 
         def _call(arg: str, asker):
             """<<call {"to": name}>>: an intercom call from the asking
@@ -1139,8 +1194,9 @@ async def amain():
                         time.sleep(1)
                         continue
                     if text and not stop():
+                        who = _who(conn, hf_ears.last_pcm)
                         loop.call_soon_threadsafe(hf_q.put_nowait,
-                                                  (conn, text))
+                                                  (conn, text, False, who))
             conn.hf_thread = threading.Thread(target=work, daemon=True)
             conn.hf_thread.start()
 
@@ -1197,7 +1253,8 @@ async def amain():
             bridge.on_listen = _hf_listen
             bridge.on_image = _on_image
             bridge.on_phone_result = _on_phone_result
-            bridge.on_text = lambda conn, t: hf_q.put_nowait((conn, t, "typed"))
+            bridge.on_text = lambda conn, t: hf_q.put_nowait(
+                (conn, t, True, bridge.devices().get(conn.id, {}).get("owner")))
             bridge.devices_file = os.path.join(CFG["agent_dir"], ".backtalk", "devices.json")
             os.makedirs(os.path.dirname(bridge.devices_file), exist_ok=True)
             DIRECTION_HOOKS.append(_announce)
@@ -1276,7 +1333,7 @@ async def amain():
             done, _ = await asyncio.wait(
                 waiters, return_when=asyncio.FIRST_COMPLETED)
             if hf_fut is not None and hf_fut in done:
-                conn, text, *typed = hf_fut.result(); hf_fut = None
+                conn, text, typed, who = hf_fut.result(); hf_fut = None
                 if typed:
                     # Typed in the face's terminal: no listening checks;
                     # queued behind a reply like a tap. A quit phrase is
@@ -1287,7 +1344,7 @@ async def amain():
                         continue
                     await handle(text, spoke_from=time.monotonic(),
                                  interrupt=False,
-                                 remote_sink=bridge.make_sink(conn), typed=True)
+                                 remote_sink=bridge.make_sink(conn), typed=True, who=who)
                     continue
                 if conn.disconnected or not conn.listening:
                     continue
@@ -1394,6 +1451,8 @@ async def amain():
                         session.cancel()
                     text = (await loop.run_in_executor(None, session.finish)
                             if pcm is not None else None)
+                    who = (await loop.run_in_executor(None, _who, conn, pcm)
+                           if text else None)
                 except Exception as e:
                     session.cancel()
                     if explain_audio_failure(e):
@@ -1429,7 +1488,7 @@ async def amain():
                     continue
                 await handle(text, spoke_from=press_t,
                             interrupt=is_interrupt,
-                            remote_sink=bridge.make_sink(conn))
+                            remote_sink=bridge.make_sink(conn), who=who)
     except KeyboardInterrupt:
         pass
     finally:
