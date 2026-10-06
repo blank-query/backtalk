@@ -65,6 +65,8 @@ import threading
 from difflib import SequenceMatcher
 import time
 
+import numpy as np
+
 from backtalk import signals, voiceprint
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
@@ -80,6 +82,19 @@ NAME = CFG["name"]
 _LAST_SPOKEN = [0.0]
 QUIT_PHRASES = CFG["quit_phrases"]
 ENROLL_S = 45      # seconds of speech an <<enroll>> collects before it says done
+ANNOUNCE_LULL_S = 1.5   # quiet needed on a device before an announcement plays
+
+
+def rewind_point(pcm, pos: int, rate: int, back_s: float = 3.0) -> int:
+    """Where a paused announcement resumes: about back_s before `pos`, at
+    the quietest 30 ms within a second of that mark (a gap between words),
+    so it never restarts mid-syllable and the listener gets a lead-in."""
+    target = max(0, pos - int(back_s * rate))
+    lo, hi, f = max(0, target - rate), min(pos, target + rate), int(rate * 0.03)
+    if hi - lo < f:
+        return target
+    frames = range(lo, hi - f, f // 2)
+    return min(frames, key=lambda i: float(np.mean(np.abs(pcm[i:i + f].astype(np.float32)))))
 # What a dedicated session is told on top of the usual (see _session).
 _SESSION_PROMPT = (
     "\n\nTHIS IS A DEDICATED SESSION, not the main one. Its purpose: {purpose}. "
@@ -1205,13 +1220,37 @@ async def amain():
                     brain_for(asker).ask(f"[Call not placed: {e}]", asker)
             loop.call_soon_threadsafe(place)
 
+        def _busy(cid) -> bool:
+            """Is that device's speaker in use by anything but an
+            announcement, or about to be (the session that owns it is
+            mid-turn; the main session's turns are for every device, so
+            they don't count)?"""
+            return (time.monotonic() < bridge.voice_until.get(cid, 0) + ANNOUNCE_LULL_S
+                    or (cid in sessions and (sessions[cid].turn_active
+                                             or sessions[cid].mouth.speaking)))
+
         def _play_announcement(conn, text: str):
-            sink = bridge.make_sink(conn)
+            """An announcement yields: it waits for a lull on that device,
+            and if the device gets busy mid-way (a cooking step, a reply)
+            it pauses, then resumes about 3 s back, from a quiet gap
+            between words. Paced in real time so the pause lands on time."""
+            sink = bridge.make_sink(conn, low=True)
             chunks = list(synth_stream(text))
             rate = chunks[0][0]
-            sink(rate, chime(rate))
-            for r, pcm in chunks:
-                sink(r, pcm)
+            pcm = np.concatenate([chime(rate)] + [p for _, p in chunks])
+            deadline = time.monotonic() + 15 * 60     # never wait forever
+            block, pos = rate // 10, 0
+            while pos < len(pcm):
+                if _busy(conn.id) and time.monotonic() < deadline:
+                    if pos:
+                        log(f"[announce] paused on {bridge.name_of(conn.id)}")
+                    while _busy(conn.id) and time.monotonic() < deadline:
+                        time.sleep(0.2)
+                    pos = rewind_point(pcm, pos, rate) if pos else 0
+                    continue
+                sink(rate, pcm[pos:pos + block])
+                time.sleep(block / rate)
+                pos += block
             sink.reply_done()
             log(f"[announce] to {bridge.name_of(conn.id)}: {text[:120]}")
 

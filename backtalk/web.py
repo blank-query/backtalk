@@ -271,6 +271,10 @@ class BrowserBridge:
         # main session's broadcasts skip them, so its replies and stops
         # never land on, say, the kitchen mid-recipe.
         self.owned: dict = {}
+        # Per device id: until when its speaker is busy with something
+        # that isn't an announcement (make_sink). Announcements wait for a
+        # lull and pause when it gets busy again (main.py).
+        self.voice_until: dict[str, float] = {}
         # Each device's recent conversation lines, replayed on hello so a
         # reload keeps its terminal. Memory only.
         self._lines: dict[str, collections.deque] = {}
@@ -479,9 +483,11 @@ class BrowserBridge:
             return None
         return np.concatenate(frames)
 
-    def make_sink(self, conn: Conn):
+    def make_sink(self, conn: Conn, low: bool = False):
         """Returns a (rate, pcm) -> None closure for mouth.py's _write
-        to call per audio block. Must never let a dead browser socket
+        to call per audio block. `low`: an announcement's audio, which
+        yields to everything else; any other audio marks the device as
+        busy talking (voice_until) so announcements wait for a lull. Must never let a dead browser socket
         affect local playback — every failure is swallowed here, not
         left for the caller to handle."""
         loop = self._loop
@@ -501,6 +507,8 @@ class BrowserBridge:
             c = live()
             if c is None or loop is None:
                 return
+            if not low and conn.id:
+                self.voice_until[conn.id] = time.monotonic() + len(pcm) / rate + 0.3
             try:
                 frame = struct.pack("<I", rate) + pcm.tobytes()
                 asyncio.run_coroutine_threadsafe(c.ws.send(frame), loop)
