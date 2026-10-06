@@ -153,6 +153,11 @@ class WarmBrain:
         # the count). Published on every change so faces can draw one
         # satellite per task.
         self._active_tasks: set[str] = set()
+        # Which device's turn started each background task. Its finish
+        # makes the agent speak up in a turn nobody asked for just then,
+        # but it WAS asked for, in advance (a cooking timer, a long
+        # build): that turn goes back to the device that asked.
+        self._task_owner: dict = {}
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -229,6 +234,7 @@ class WarmBrain:
         """Reset the active-task set to empty (fresh launch, or the
         session itself was cleared/reset underneath it)."""
         self._active_tasks.clear()
+        self._task_owner.clear()
         signals.set_tasks(0)
         signals.set_active_conn(None)
 
@@ -557,6 +563,8 @@ class WarmBrain:
                 if isinstance(msg, TaskStartedMessage):
                     self._active_tasks.add(msg.task_id)
                     signals.set_tasks(len(self._active_tasks))
+                    if self._current_asker is not None:
+                        self._task_owner[msg.task_id] = self._current_asker
                 elif isinstance(msg, (TaskNotificationMessage,
                                       TaskUpdatedMessage)):
                     # A terminal status can arrive on EITHER message type,
@@ -567,6 +575,14 @@ class WarmBrain:
                     if status in TERMINAL_TASK_STATUSES:
                         self._active_tasks.discard(msg.task_id)
                         signals.set_tasks(len(self._active_tasks))
+                        # The turn this finish triggers comes next: owe it
+                        # to the device that started the task, unless a
+                        # turn is already running (it keeps its own asker).
+                        owner = self._task_owner.pop(msg.task_id, None)
+                        if owner is not None and not self._turn_active \
+                                and self._current_asker is None:
+                            self._current_asker = owner
+                            signals.set_active_conn(getattr(owner, "conn_id", None))
 
                 if self._capture is not None:
                     if t == "AssistantMessage":
