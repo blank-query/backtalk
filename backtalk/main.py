@@ -1050,6 +1050,14 @@ async def amain():
                                  args=(conn, str(a.get("text") or ""))).start()
 
         def _who(conn, pcm) -> str | None:
+            # A voiceprint failure must never cost an utterance: untagged.
+            try:
+                return _who_(conn, pcm)
+            except Exception as e:
+                log(f"[voice] voiceprint skipped: {e!r}")
+                return None
+
+        def _who_(conn, pcm) -> str | None:
             """Who said this, for the agent's tag: the device's owner on a
             personal device (its prints are kept too, so they're ready for
             shared ones), else the voiceprint, else "voice unknown". A clip
