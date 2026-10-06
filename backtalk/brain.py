@@ -96,11 +96,20 @@ SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
 
 class WarmBrain:
     def __init__(self, model: str | None = None, can_use_tool=None,
-                 resume_id: str | None = None, mouth=None):
+                 resume_id: str | None = None, mouth=None, bus=None,
+                 append: str = "", persist: bool = True, label: str = "Jarvis"):
         # Full model id ON PURPOSE — never a bare alias. The SDK
         # resolves aliases through its own bundled CLI and can silently
         # land on an older model.
         self.model = model or CFG["model"]
+        # Where face signals go (see Mouth), and extra system-prompt text
+        # for a dedicated session ("you are the kitchen's cooking session").
+        self.bus = bus or signals
+        self._append = append
+        # Only the main session's id is saved for resume: a dedicated
+        # session saving its own would hijack the next launch.
+        self._persist = persist
+        self.label = label           # the log's speaker tag: "Jarvis", "Jarvis@Kitchen"
         # The spoken permission gate (main.py builds it). Wired at
         # connect in EVERY mode, so a live mode flip needs no reconnect;
         # bypass simply never consults it.
@@ -179,7 +188,7 @@ class WarmBrain:
                 cwd=CFG["agent_dir"],
                 model=self.model,
                 system_prompt={"type": "preset", "preset": "claude_code",
-                               "append": DISCIPLINE},
+                               "append": DISCIPLINE + self._append},
                 include_partial_messages=True,
                 permission_mode=sdk_mode,
                 can_use_tool=self._can_use_tool,
@@ -227,7 +236,7 @@ class WarmBrain:
         utterance, remote_sink, self._ask_t0 = self._ask_queue.popleft()
         self._turn_active = True
         self._current_asker = remote_sink
-        signals.set_active_conn(getattr(remote_sink, "conn_id", None))
+        self.bus.set_active_conn(getattr(remote_sink, "conn_id", None))
         asyncio.ensure_future(self._client.query(utterance))
 
     def clear_tasks(self):
@@ -235,8 +244,8 @@ class WarmBrain:
         session itself was cleared/reset underneath it)."""
         self._active_tasks.clear()
         self._task_owner.clear()
-        signals.set_tasks(0)
-        signals.set_active_conn(None)
+        self.bus.set_tasks(0)
+        self.bus.set_active_conn(None)
 
     def _start_reader(self):
         self._reader_task = asyncio.ensure_future(self._read_forever())
@@ -268,7 +277,7 @@ class WarmBrain:
         """Persist the session id after a completed turn, so the next
         launch can reattach (config: resume_last_session). Must never
         break a turn; silence on any failure."""
-        if not CFG.get("resume_last_session"):
+        if not CFG.get("resume_last_session") or not self._persist:
             return
         sid = getattr(rm, "session_id", None)
         if not sid:
@@ -339,7 +348,7 @@ class WarmBrain:
                 resets = w.get("resets_at")
                 if isinstance(resets, str):
                     resets = int(datetime.fromisoformat(resets).timestamp())
-                signals.set_rate_limit(window, pct, resets)
+                self.bus.set_rate_limit(window, pct, resets)
         except Exception:
             pass
 
@@ -480,8 +489,8 @@ class WarmBrain:
                 if first:
                     turn_sink = self._current_asker or self.remote_sink
                     self._ask_t0 = None
-                    signals.static_stop()
-                log(f"[Jarvis] (quiet) {s}"
+                    self.bus.static_stop()
+                log(f"[{self.label}] (quiet) {s}"
                     + (f"  <directions: {pending}>" if pending else ""))
                 _line(turn_sink, s)
                 if pending:
@@ -505,14 +514,14 @@ class WarmBrain:
                 lag = (f"({time.time() - self._ask_t0:.1f}s to first) "
                        if self._ask_t0 else "")
                 self._ask_t0 = None
-                log(f"[Jarvis] {lag}{s}"
+                log(f"[{self.label}] {lag}{s}"
                     + (f"  <directions: {pending}>" if pending else ""))
                 _line(turn_sink, s)
                 self.mouth.say_chunk(s, pending, turn_sink)
                 pending = []
                 first = False
             else:
-                log(f"[Jarvis] {s}"
+                log(f"[{self.label}] {s}"
                     + (f"  <directions: {pending}>" if pending else ""))
                 _line(turn_sink, s)
                 batch.append(s)
@@ -534,8 +543,8 @@ class WarmBrain:
                 # Zero sentences yielded (brain error / empty turn), or a
                 # text-only reply: park the bus rather than leave it on
                 # "thinking" forever.
-                signals.static_stop()
-                signals.set_state("idle")
+                self.bus.static_stop()
+                self.bus.set_state("idle")
             first, batch, pending, quiet = True, [], [], False
 
         stream = self._client.receive_messages().__aiter__()
@@ -562,7 +571,7 @@ class WarmBrain:
 
                 if isinstance(msg, TaskStartedMessage):
                     self._active_tasks.add(msg.task_id)
-                    signals.set_tasks(len(self._active_tasks))
+                    self.bus.set_tasks(len(self._active_tasks))
                     if self._current_asker is not None:
                         self._task_owner[msg.task_id] = self._current_asker
                 elif isinstance(msg, (TaskNotificationMessage,
@@ -574,7 +583,7 @@ class WarmBrain:
                         or (getattr(msg, "patch", None) or {}).get("status")
                     if status in TERMINAL_TASK_STATUSES:
                         self._active_tasks.discard(msg.task_id)
-                        signals.set_tasks(len(self._active_tasks))
+                        self.bus.set_tasks(len(self._active_tasks))
                         # The turn this finish triggers comes next: owe it
                         # to the device that started the task, unless a
                         # turn is already running (it keeps its own asker).
@@ -582,7 +591,7 @@ class WarmBrain:
                         if owner is not None and not self._turn_active \
                                 and self._current_asker is None:
                             self._current_asker = owner
-                            signals.set_active_conn(getattr(owner, "conn_id", None))
+                            self.bus.set_active_conn(getattr(owner, "conn_id", None))
 
                 if self._capture is not None:
                     if t == "AssistantMessage":
@@ -641,7 +650,7 @@ class WarmBrain:
                     # (background report) animates every tab, matching
                     # its broadcast audio. A reply still playing keeps its
                     # tab via mouth's playing stamp, which wins.
-                    signals.set_active_conn(None)
+                    self.bus.set_active_conn(None)
                     if was_discarding:
                         buf = ""
                         first, batch, pending = True, [], []
@@ -677,7 +686,7 @@ class WarmBrain:
         self._client = ClaudeSDKClient(options=ClaudeAgentOptions(
             cwd=CFG["agent_dir"], model=self.model,
             system_prompt={"type": "preset", "preset": "claude_code",
-                           "append": DISCIPLINE},
+                           "append": DISCIPLINE + self._append},
             include_partial_messages=True,
             permission_mode=("default" if CFG["permission_mode"] == "ask"
                              else CFG["permission_mode"]),

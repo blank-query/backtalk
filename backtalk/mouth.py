@@ -365,13 +365,13 @@ def _stream_piper(text: str):
 DIRECTION_HOOKS: list = []
 
 
-def _fire_directions(directions, remote_sink, phone):
+def _fire_directions(directions, remote_sink, phone, bus=None):
     """Publish a sentence's stage directions as its audio starts, and send
     its <<phone {json}>> commands to the device that asked (the Android
     app); an interrupted reply never fires them. `phone` is
     _phone_frames(directions), built before the sentence's synthesis."""
     from backtalk import signals
-    signals.direction(directions)
+    (bus or signals).direction(directions)
     send = getattr(remote_sink, "send", None)
     for d, frame in phone:
         if send is None or isinstance(frame, Exception):
@@ -447,8 +447,14 @@ def _synth_raw(text: str, timeout: float = 30.0):
 
 
 class Mouth:
-    def __init__(self):
+    def __init__(self, bus=None, local: bool = True):
+        """`bus`: where the face signals go (signals, the default, or a
+        DeviceBus for a session that owns one device). `local` False: no
+        local speakers, devices only."""
+        from backtalk import signals
         from backtalk.ducking import Ducker
+        self.bus = bus or signals
+        self.local = local
         self._q: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._speaking = threading.Event()
@@ -512,7 +518,6 @@ class Mouth:
                 return
 
     def _run(self):
-        from backtalk import signals
         while True:
             item = self._q.get()
             if isinstance(item, tuple) and len(item) == 3:
@@ -528,15 +533,15 @@ class Mouth:
                 # played, which is now. That sentence skipped its end-of-
                 # reply bookkeeping because this item was still queued.
                 if directions:
-                    _fire_directions(directions, remote_sink, _phone_frames(directions))
+                    _fire_directions(directions, remote_sink, _phone_frames(directions), self.bus)
                 if self._q.empty() and self._speaking.is_set():
                     self._reply_finished(remote_sink)
                 continue
             self._stop.clear()
             self._speaking.set()
             self.ducker.speech_start()
-            signals.static_stop()     # thinking sound dies when speech starts
-            signals.set_state("speaking")
+            self.bus.static_stop()     # thinking sound dies when speech starts
+            self.bus.set_state("speaking")
             try:
                 self._play_stream(sentence, directions, remote_sink=remote_sink)
             except Exception as e:
@@ -548,14 +553,13 @@ class Mouth:
     def _reply_finished(self, remote_sink):
         """The reply has genuinely stopped talking, as opposed to the gap
         between two sentences of the same reply."""
-        from backtalk import signals
         self._speaking.clear()
         if remote_sink is not None:
             remote_sink.reply_done()
-        signals.reply_done()
+        self.bus.reply_done()
         self.ducker.speech_end()
-        signals.clear_playing_conn()
-        signals.set_state("idle")
+        self.bus.clear_playing_conn()
+        self.bus.set_state("idle")
 
     def _get_out(self, rate: int) -> sd.OutputStream:
         """The long-lived stream (audio law #1). Reopened only when the
@@ -616,9 +620,8 @@ class Mouth:
         say_chunk). Its own send failures are its problem, never
         ours — a dead browser socket must never take down the local
         output stream below."""
-        from backtalk import signals
-        local_on = bool(CFG.get("web", {}).get(
-            "local_playback_on_remote_turn", True)) or remote_sink is None
+        local_on = self.local and (bool(CFG.get("web", {}).get(
+            "local_playback_on_remote_turn", True)) or remote_sink is None)
         phone = _phone_frames(directions)   # before this sentence's own synthesis
         gen = synth_stream(sentence)
         head: list = []
@@ -654,9 +657,9 @@ class Mouth:
             # flight while this one still speaks. The playing tab wins over
             # the in-flight one for as long as audio is actually going out
             # (see signals.set_playing_conn).
-            signals.set_playing_conn(getattr(remote_sink, "conn_id", None))
+            self.bus.set_playing_conn(getattr(remote_sink, "conn_id", None))
             if directions:
-                _fire_directions(directions, remote_sink, phone)
+                _fire_directions(directions, remote_sink, phone, self.bus)
 
             def _write(pcm):
                 for i in range(0, len(pcm), block):
@@ -679,7 +682,7 @@ class Mouth:
                     # re-assert "speaking" over a fresh "listening".
                     if self._stop.is_set():
                         return False
-                    signals.feed_waveform(block_pcm)
+                    self.bus.feed_waveform(block_pcm)
                     if remote_sink is not None:
                         remote_sink(rate, block_pcm)
                 return True

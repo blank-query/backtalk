@@ -267,6 +267,10 @@ class BrowserBridge:
         self.on_phone_result = None   # main.py: (Conn, text) from a phone command
         self.devices_file = None      # main.py: the device names (see saw)
         self.on_text = None           # main.py: (Conn, text) typed in the terminal
+        # Devices a dedicated session owns (main.py's sessions, by id): the
+        # main session's broadcasts skip them, so its replies and stops
+        # never land on, say, the kitchen mid-recipe.
+        self.owned: dict = {}
         # Each device's recent conversation lines, replayed on hello so a
         # reload keeps its terminal. Memory only.
         self._lines: dict[str, collections.deque] = {}
@@ -542,20 +546,23 @@ class BrowserBridge:
         TIME, built fresh from self._conns each call so a tab
         connecting or disconnecting mid-reply needs no bookkeeping
         here."""
+        def conns():
+            return [c for c in list(self._conns) if c.id not in self.owned]
+
         def _sink(rate: int, pcm: np.ndarray):
-            for conn in list(self._conns):
+            for conn in conns():
                 self.make_sink(conn)(rate, pcm)
 
         def _reply_done():
-            for conn in list(self._conns):
+            for conn in conns():
                 self.make_sink(conn).reply_done()
 
         def _stop():
-            for conn in list(self._conns):
+            for conn in conns():
                 self.make_sink(conn).stop()
 
         def _send(obj: dict):
-            for conn in list(self._conns):
+            for conn in conns():
                 self.make_sink(conn).send(obj)
 
         _sink.reply_done = _reply_done

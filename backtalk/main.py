@@ -80,6 +80,14 @@ NAME = CFG["name"]
 _LAST_SPOKEN = [0.0]
 QUIT_PHRASES = CFG["quit_phrases"]
 ENROLL_S = 45      # seconds of speech an <<enroll>> collects before it says done
+# What a dedicated session is told on top of the usual (see _session).
+_SESSION_PROMPT = (
+    "\n\nTHIS IS A DEDICATED SESSION, not the main one. Its purpose: {purpose}. "
+    "It owns one device, {device}: everything said there comes to you, and your "
+    "replies and your background tasks' reports go there only. The main session "
+    "carries on separately and handles everything else. Your first message is its "
+    "brief. When the purpose is done (the person says so), end that reply with "
+    "<<session end>> to hand the device back.")
 
 # ---- THE SPOKEN PERMISSION GATE (permission_mode "ask", the default).
 # When the agent wants a gated tool, the SDK routes the decision here:
@@ -877,6 +885,23 @@ async def amain():
                 say(say_after)
         signals.set_state("idle")
 
+    # DEDICATED SESSIONS: a second Claude Code session that owns one
+    # device while it runs (cook-with-me in the kitchen), so it's never
+    # stuck behind the main session's work. Opt-in and per purpose, NOT
+    # per connection (that was tried and reverted, see below): the main
+    # session starts one with <<session {"purpose", "brief"}>>, the
+    # device's speech goes to it until it ends itself with <<session end>>.
+    # Its face signals go to that device's own channel (signals.DeviceBus).
+    sessions: dict = {}           # device id -> WarmBrain
+    handed_back: dict = {}        # device id -> a note for the main session's next message from it
+
+    def brain_for(x):
+        """The session that owns this device (a conn, a sink, or an id),
+        else the main one."""
+        cid = x if isinstance(x, str) else (getattr(x, "conn_id", None)
+                                            or getattr(x, "id", None))
+        return sessions.get(cid, brain)
+
     async def handle(text: str, spoke_from: float | None = None,
                      interrupt: bool = True, remote_sink=None,
                      typed: bool = False, who: str | None = None) -> bool:
@@ -940,15 +965,16 @@ async def amain():
             # its ResultMessage already landed (see the Backtalk Turn
             # Stream Redesign note's interrupt-gap fix), so gating this
             # on brain.turn_active left that whole window unstoppable.
-            if brain.turn_active:
+            b = brain_for(remote_sink)
+            if b.turn_active:
                 # The reader (brain.py) owns speaking now — interrupt()
                 # is a clean async call, nothing here to cancel-and-await.
                 log("[turn] interrupted mid-reply by new input")
                 _deny_pending()      # an ask never outlives its turn
-                await brain.interrupt()
-            mouth.shut_up()
-            if brain.remote_sink is not None:
-                brain.remote_sink.stop()
+                await b.interrupt()
+            b.mouth.shut_up()
+            if b.remote_sink is not None:
+                b.remote_sink.stop()
         verb = verb or console_match(text)
         if verb:
             await run_console(verb, remote_sink)
@@ -963,6 +989,9 @@ async def amain():
         tags = [f"from {where}"] if where else []
         if who:
             tags.append(who)
+        if remote_sink is not None and getattr(remote_sink, "conn_id", None) in handed_back \
+                and brain_for(remote_sink) is brain:
+            tags.append(handed_back.pop(remote_sink.conn_id))
         if typed:
             ago = time.monotonic() - _LAST_SPOKEN[0] if _LAST_SPOKEN[0] else None
             tags.append("typed; " + (f"last spoken exchange {ago / 60:.0f} min ago"
@@ -980,7 +1009,7 @@ async def amain():
         if not typed:          # typing usually means keep it quiet
             signals.static_start()
         _deny_pending()
-        brain.ask(text, remote_sink=remote_sink)
+        brain_for(remote_sink).ask(text, remote_sink=remote_sink)
         return True
 
     try:
@@ -1033,6 +1062,8 @@ async def amain():
                     _call(d[5:], asker)
                 if d.startswith("enroll "):
                     _enroll(d[7:], asker)
+                if d.startswith("session "):
+                    _session(d[8:].strip(), asker)
                 if not d.startswith("announce "):
                     continue
                 try:
@@ -1044,7 +1075,7 @@ async def amain():
                 except Exception as e:
                     log(f"[announce] not delivered: {e}")
                     loop.call_soon_threadsafe(
-                        brain.ask, f"[Announcement not delivered: {e}]", asker)
+                        brain_for(asker).ask, f"[Announcement not delivered: {e}]", asker)
                     continue
                 threading.Thread(target=_play_announcement, daemon=True,
                                  args=(conn, str(a.get("text") or ""))).start()
@@ -1074,7 +1105,7 @@ async def amain():
                     conn.enroll = None
                     log(f"[voice] enrolled {enroll['name']} on {bridge.name_of(conn.id)}")
                     loop.call_soon_threadsafe(
-                        brain.ask, f"[Voice enrollment done: {enroll['name']}, "
+                        brain_for(conn).ask, f"[Voice enrollment done: {enroll['name']}, "
                         f"{enroll['s']:.0f} s of speech on this device]", bridge.make_sink(conn))
                 return f"{enroll['name']} (enrolling)"
             if owner:
@@ -1105,7 +1136,53 @@ async def amain():
                 log(f"[voice] enrolling {name} on {bridge.name_of(conn.id)}")
             except Exception as e:
                 log(f"[voice] enrollment not started: {e!r}")
-                loop.call_soon_threadsafe(brain.ask, f"[Enrollment not started: {e!r}]", asker)
+                loop.call_soon_threadsafe(brain_for(asker).ask, f"[Enrollment not started: {e!r}]", asker)
+
+        def _session(arg: str, asker):
+            """<<session {"purpose": ..., "brief": ...}>> from the main
+            session: a dedicated session takes over the asking device.
+            <<session end>> from that dedicated session: it hands the
+            device back. Failures go back to whoever asked."""
+            cid = getattr(asker, "conn_id", None)
+
+            async def run():
+                try:
+                    if arg == "end":
+                        b = sessions.pop(cid, None)
+                        if b is None:
+                            return
+                        log(f"[session] ended on {bridge.name_of(cid)}")
+                        handed_back[cid] = "the dedicated session for this device has ended; it's yours again"
+                        await loop.run_in_executor(None, lambda: b.mouth.wait_done(timeout=30))
+                        await b.stop()
+                        b.mouth.shutdown()
+                        b.bus.close()
+                        return
+                    a = json.loads(arg)
+                    conn = next((c for c in list(bridge._conns) if c.id == cid
+                                 and not c.disconnected), None)
+                    if conn is None:
+                        raise LookupError("a dedicated session needs a device to run on")
+                    if cid in sessions:
+                        raise RuntimeError(f"{bridge.name_of(cid)} already has a dedicated session")
+                    name = bridge.name_of(cid)
+                    bus = signals.DeviceBus(cid)
+                    m = Mouth(bus=bus, local=False)
+                    b = WarmBrain(model=brain.model, mouth=m, bus=bus, persist=False,
+                                  label=f"Jarvis@{name}",
+                                  append=_SESSION_PROMPT.format(purpose=a.get("purpose", "?"),
+                                                                device=name))
+                    b._can_use_tool = make_permission_gate(m, b)
+                    b.remote_sink = bridge.make_sink(conn)
+                    await b.start()
+                    sessions[cid] = b
+                    log(f"[session] {a.get('purpose')!r} started on {name}")
+                    b.ask(f"[Dedicated session started: {a.get('purpose')}. Brief from the "
+                          f"main session: {a.get('brief', '')}]", bridge.make_sink(conn))
+                except Exception as e:
+                    log(f"[session] not started: {e!r}")
+                    brain_for(asker).ask(f"[Dedicated session not started: {e!r}]", asker)
+            asyncio.run_coroutine_threadsafe(run(), loop)
 
         def _call(arg: str, asker):
             """<<call {"to": name}>>: an intercom call from the asking
@@ -1125,7 +1202,7 @@ async def amain():
                     bridge.start_call(caller, callee)
                 except Exception as e:
                     log(f"[call] not placed: {e}")
-                    brain.ask(f"[Call not placed: {e}]", asker)
+                    brain_for(asker).ask(f"[Call not placed: {e}]", asker)
             loop.call_soon_threadsafe(place)
 
         def _play_announcement(conn, text: str):
@@ -1144,7 +1221,7 @@ async def amain():
             goes back there."""
             log(f"[phone] result from {str(conn.id)[:8]}: {text[:200]}")
             signals.set_state("thinking")
-            brain.ask(f"[The phone reports back on your last command: {text}]",
+            brain_for(conn).ask(f"[The phone reports back on your last command: {text}]",
                       remote_sink=bridge.make_sink(conn))
 
         # Browser hands-free: one listener thread per listening tab,
@@ -1217,7 +1294,8 @@ async def amain():
             if not limit:
                 return
             now = time.monotonic()
-            if brain.turn_active or mouth.speaking:
+            if any(b.turn_active or b.mouth.speaking
+                   for b in [brain, *sessions.values()]):
                 _MIC["active"] = now
                 for c in conns:
                     c.active = now
@@ -1266,6 +1344,7 @@ async def amain():
             bridge.devices_file = os.path.join(CFG["agent_dir"], ".backtalk", "devices.json")
             os.makedirs(os.path.dirname(bridge.devices_file), exist_ok=True)
             DIRECTION_HOOKS.append(_announce)
+            bridge.owned = sessions
             brain.remote_sink = bridge.make_broadcast_sink()
             asyncio.create_task(bridge.serve())
         ptt = PTTListener(CFG["ptt_key"])

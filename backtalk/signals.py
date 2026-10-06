@@ -342,3 +342,71 @@ def static_stop():
         os.remove(_LOADING_PID_FILE)
     except OSError:
         pass
+
+
+# ---- per-device channels: a second agent session (a dedicated session
+# that owns one device, e.g. cook-with-me in the kitchen) can't share the
+# one bus above, which is the main session's. Its signals go to
+# .voice_devices, {device_id: {state, ts, samples, wave_ts, tasks}}, and the
+# face server reports that entry to that device instead of the bus. A
+# DeviceBus has the same functions as this module, so brain and mouth take
+# either; the ones that make no sense for one device are no-ops.
+_DEVICES_FILE = os.path.join(_DIR, ".voice_devices")
+_dev_lock = threading.Lock()
+
+
+def _dev_update(conn_id: str, **fields):
+    with _dev_lock:
+        try:
+            with open(_DEVICES_FILE) as f:
+                devs = json.load(f)
+        except (OSError, ValueError):
+            devs = {}
+        if fields.get("_drop"):
+            devs.pop(conn_id, None)
+        else:
+            devs.setdefault(conn_id, {}).update(fields, ts=time.time())
+        try:
+            tmp = f"{_DEVICES_FILE}.tmp{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump(devs, f)
+            os.replace(tmp, _DEVICES_FILE)
+        except OSError:
+            pass
+
+
+class DeviceBus:
+    def __init__(self, conn_id: str):
+        self.conn_id = str(conn_id)
+        self._last_wave = 0.0
+        _dev_update(self.conn_id, state="idle", tasks=0)
+
+    def set_state(self, name: str):
+        _dev_update(self.conn_id, state=name)
+
+    def feed_waveform(self, pcm: np.ndarray):
+        now = time.time()
+        if pcm.size == 0 or now - self._last_wave < _WAVEFORM_MIN_INTERVAL:
+            return
+        self._last_wave = now
+        idx = np.linspace(0, pcm.size - 1, 64).astype(int)
+        _dev_update(self.conn_id, state="speaking", wave_ts=now,
+                    samples=pcm[idx].astype(float).tolist())
+
+    def set_tasks(self, n: int):
+        _dev_update(self.conn_id, tasks=int(n))
+
+    def close(self):
+        _dev_update(self.conn_id, _drop=True)
+
+    # the main bus's business, or meaningless for one device
+    def set_active_conn(self, conn_id): pass
+    def set_playing_conn(self, conn_id): pass
+    def clear_playing_conn(self): pass
+    def direction(self, items): pass
+    def reply_done(self): pass
+    def static_start(self): pass
+    def static_stop(self): pass
+
+    def set_rate_limit(self, window, utilization, resets_at):
+        set_rate_limit(window, utilization, resets_at)
