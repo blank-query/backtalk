@@ -25,6 +25,7 @@ an utterance opens after ~120ms of sustained speech, closes after
 `silence_ms` of trailing quiet. A `gate` callable can suppress
 listening (so the open mic ignores the speakers unless barge-in is on).
 """
+import os
 import platform
 import queue
 import time
@@ -44,6 +45,49 @@ FRAME_MS = 30
 FRAME_LEN = RATE * FRAME_MS // 1000  # samples per frame
 OPEN_FRAMES = 4        # ~120ms speech to open an utterance
 MAX_UTTER_S = 30
+# The open mic decides "still talking" with Silero, a neural speech
+# detector (already here for faster-whisper), not webrtcvad: webrtcvad
+# heard kitchen clatter and running water as speech, so an utterance never
+# found its 1.5 s of silence and ran to the MAX_UTTER_S ceiling (measured:
+# ~23 s after the speaker stopped; Silero: about the silence wait).
+# Loudness gates can't help: a pan is as loud as a word. webrtcvad stays
+# as the fallback if Silero won't load.
+SPEECH_P = 0.5
+# ...but Silero alone cut people off mid-thought (soft words, an "um", a
+# breath score low), where webrtcvad held on. So a frame also counts when
+# webrtcvad hears something AND Silero gives it at least SPEECH_P_SOFT:
+# clatter and water score near zero, soft speech doesn't.
+SPEECH_P_SOFT = float(os.environ.get("BACKTALK_SPEECH_P_SOFT", "0.15"))
+
+
+_silero = None
+
+
+class _SpeechProb:
+    """Silero speech probability, streamed: feed 30 ms frames, get the
+    latest 32 ms chunk's probability. Own recurrent state per listener;
+    one shared ONNX session."""
+
+    def __init__(self):
+        global _silero
+        if _silero is None:
+            from faster_whisper.vad import get_vad_model
+            _silero = get_vad_model().session
+        self.h = np.zeros((1, 1, 128), np.float32)
+        self.c = np.zeros((1, 1, 128), np.float32)
+        self.ctx = np.zeros(64, np.float32)
+        self.buf = np.zeros(0, np.float32)
+        self.p = 0.0
+
+    def feed(self, mono: np.ndarray) -> float:
+        self.buf = np.concatenate([self.buf, mono.astype(np.float32) / 32768.0])
+        while len(self.buf) >= 512:
+            chunk, self.buf = self.buf[:512], self.buf[512:]
+            out, self.h, self.c = _silero.run(None, {
+                "input": np.concatenate([self.ctx, chunk])[None, :], "h": self.h, "c": self.c})
+            self.ctx = chunk[-64:]
+            self.p = float(np.ravel(out)[0])
+        return self.p
 
 _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
 # Wails and grunts whisper spells out ("AHHH! AHHH!", "oh, oh, oh"):
@@ -482,6 +526,25 @@ class Session:
         return _NONSPEECH.sub("", text).strip()
 
 
+def _log_capture(pcm: np.ndarray, capped: bool):
+    """An open-mic utterance's length and how it ended, and when it ran
+    to the ceiling, its audio (logs/capped/), to tune the gate on real
+    rooms."""
+    log(f"[ears] open-mic utterance {len(pcm) / RATE:.1f}s, ended "
+        f"{'at the ' + str(MAX_UTTER_S) + 's ceiling' if capped else 'on silence'}")
+    if not capped:
+        return
+    try:
+        import os, wave
+        d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "capped")
+        os.makedirs(d, exist_ok=True)
+        with wave.open(os.path.join(d, time.strftime("%Y%m%d-%H%M%S.wav")), "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
+            w.writeframes(pcm.astype(np.int16).tobytes())
+    except OSError as e:
+        log(f"[ears] capped capture not saved: {e}")
+
+
 class Ears:
     def __init__(self, aggressiveness: int = 2, silence_ms: int = 480):
         self.vad = webrtcvad.Vad(aggressiveness)
@@ -500,6 +563,11 @@ class Ears:
         a browser's hands-free stream (web.ListenStream)."""
         frames: list[np.ndarray] = []
         ring: list[np.ndarray] = []   # pre-roll so the first syllable survives
+        try:
+            sp = _SpeechProb()
+        except Exception as e:
+            sp = None
+            log(f"[ears] Silero unavailable, open mic falls back to webrtcvad: {e!r}")
         session = None
         speech_run = 0
         silence_run = 0
@@ -521,7 +589,12 @@ class Ears:
                         # speakers are talking and barge-in isn't on: ignore
                         ring.clear()
                         continue
-                    is_speech = self.vad.is_speech(mono.tobytes(), RATE)
+                    heard = self.vad.is_speech(mono.tobytes(), RATE)
+                    if sp is not None:
+                        p = sp.feed(mono)
+                        is_speech = p >= SPEECH_P or (heard and p >= SPEECH_P_SOFT)
+                    else:
+                        is_speech = heard
                     if not in_utterance:
                         ring.append(mono)
                         if len(ring) > 8:
@@ -543,8 +616,8 @@ class Ears:
                             silence_run = 0
                         else:
                             silence_run += 1
-                        if silence_run >= self.silence_frames or \
-                           len(frames) * FRAME_MS / 1000 > MAX_UTTER_S:
+                        capped = len(frames) * FRAME_MS / 1000 > MAX_UTTER_S
+                        if silence_run >= self.silence_frames or capped:
                             if speech_total < 8:
                                 # <240ms of actual speech: a noise blip, not
                                 # a sentence — keep listening
@@ -556,6 +629,7 @@ class Ears:
                                 continue
                             text = session.finish(); session = None
                             self.last_pcm = np.concatenate(frames)
+                            _log_capture(self.last_pcm, capped)
                             words = re.findall(r"[a-z']+", text.lower())
                             if words and all(_WAIL.fullmatch(w) for w in words):
                                 log(f"[ears] ignored a wail: {text[:40]!r}")
