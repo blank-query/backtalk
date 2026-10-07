@@ -545,6 +545,12 @@ class WarmBrain:
                 # "thinking" forever.
                 self.bus.static_stop()
                 self.bus.set_state("idle")
+            # The turn is over, spoken or not: a quiet reply has no
+            # reply_done, and a peer agent waits on this (see say.py).
+            send = getattr(turn_sink if not first else (self._current_asker or self.remote_sink),
+                           "send", None)
+            if send is not None:
+                send({"type": "turn_done"})
             first, batch, pending, quiet = True, [], [], False
 
         stream = self._client.receive_messages().__aiter__()

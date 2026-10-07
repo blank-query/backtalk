@@ -109,6 +109,18 @@ Wire protocol, deliberately tiny:
                                              device no session owns; on an
                                              owned one a press talks to its
                                              agent, muted to the far end)
+  text frame  {"type": "turn_done"}         server -> client: the agent's
+                                             turn for this device is over
+                                             (sent even for a text-only
+                                             reply, which has no reply_done)
+  PEERS (another agent; see say.py): a hello with "token" (the shared
+  peer secret) and "name" makes the connection a peer, answered with
+  {"type": "peer_ok"}; a wrong token closes it, and so does a missing
+  one from off this machine when web.require_token is on. A peer hello
+  with "link": name is that machine's outbound link (config peer_link);
+  one with "to": name is relayed down that link whole, every JSON frame
+  each way wrapped as {"type": "relay", "rid": ..., "frame": {...}}
+  ({"close": true} when either end goes).
   text frame  {"type": "listen", "on": b,   server -> browser: hands-
                "muted": b}
                                              free on or off for that
@@ -133,6 +145,8 @@ import asyncio
 import audioop
 import base64
 import collections
+import hmac
+import ipaddress
 import json
 import os
 import queue
@@ -186,6 +200,11 @@ class Conn:
         # resets on every reconnect, silently reassigning the tab
         # mid-session; the client's token survives reloads and drops.
         self.id = None
+        self.peer = None      # a peer agent's name, once its hello's token checks out
+        self.via = None       # relayed whole down this peer link (a hello's "to")
+        self.rid = None       # ...under this relay id
+        self.peer_link = None # the name this peer's outbound link serves (a hello's "link")
+        self.authed = True    # False: refused unless the first frame is a peer hello
         self.disconnected = False
         self.recording = False   # this tab's own slot, not bridge-wide
         self.listening = False   # hands-free: frames outside a press
@@ -205,6 +224,9 @@ class Conn:
         """The only loop that ever reads this connection's socket."""
         try:
             async for msg in self.ws:
+                if isinstance(msg, (bytes, bytearray)) and not self.authed:
+                    await self.ws.close(4401, "token required")
+                    return
                 if isinstance(msg, (bytes, bytearray)):
                     # A held press wins over a call (talking to the agent
                     # on a device a session owns; muted to the far end).
@@ -223,9 +245,39 @@ class Conn:
                 except ValueError:
                     continue
                 kind = data.get("type")
+                if not self.authed and not (kind == "hello" and data.get("token")):
+                    log(f"[peer] refused {self.ws.remote_address[0]}: no token")
+                    await self.ws.close(4401, "token required")
+                    return
+                if self.via:
+                    self.bridge.relay_up(self, data)
+                    continue
+                if kind == "relay" and self.bridge.links.get(self.peer_link) is self:
+                    self.bridge.relay_down(data)
+                    continue
+                if kind == "hello" and data.get("token") is not None:
+                    if not self.bridge.check_token(data.get("token")):
+                        log(f"[peer] refused {self.ws.remote_address[0]}: wrong token")
+                        await self.ws.close(4401, "wrong token")
+                        return
+                    self.authed = True
+                    self.peer = str(data.get("name") or "peer")[:40]
+                    if data.get("to"):
+                        if not self.bridge.relay_open(self, str(data["to"]), data):
+                            await self.ws.close(4404, "no link")
+                            return
+                        continue
+                    if data.get("link"):
+                        self.peer_link = str(data["link"])
+                        self.bridge.link_up(self)
+                    log(f"[peer] {self.peer} connected"
+                        + (f" (link for {self.peer_link})" if self.peer_link else ""))
+                    await self.ws.send(json.dumps({"type": "peer_ok"}))
+                    if self.peer_link:
+                        continue
                 if kind == "hello":
                     self.id = data.get("device_id") or self.id
-                    self.bridge.saw(self, data.get("model"))
+                    self.bridge.saw(self, self.peer or data.get("model"))
                     self.bridge.offer_update(self, data.get("version"))
                     if self.bridge._lines.get(self.id):
                         await self.ws.send(json.dumps(
@@ -275,6 +327,7 @@ class Conn:
             pass
         finally:
             self.disconnected = True
+            self.bridge.peer_gone(self)
             if self.call is not None:
                 self.bridge.end_call(self.call, "disconnected")
             self._released.set()         # unblock a capture awaiting release
@@ -315,6 +368,59 @@ class BrowserBridge:
         # Each device's recent conversation lines, replayed on hello so a
         # reload keeps its terminal. Memory only.
         self._lines: dict[str, collections.deque] = {}
+        self._token = None            # the peer secret, read once (see check_token)
+        self.links: dict[str, Conn] = {}    # peer links, by the name they serve
+        self._relays: dict[str, Conn] = {}  # relayed connections, by rid
+
+    # ---- peers (see the docstring's PEERS)
+
+    def check_token(self, tok) -> bool:
+        if self._token is None:
+            from backtalk.config import peer_token
+            self._token = peer_token()
+        return bool(self._token) and hmac.compare_digest(str(tok), self._token)
+
+    def link_up(self, conn: Conn):
+        old = self.links.get(conn.peer_link)
+        self.links[conn.peer_link] = conn
+        if old is not None and old is not conn:
+            asyncio.ensure_future(old.ws.close())   # a stale link from before a sleep
+
+    def relay_open(self, conn: Conn, to: str, hello: dict) -> bool:
+        if to not in self.links:
+            log(f"[peer] {conn.peer} asked for {to}, which has no link up")
+            return False
+        conn.via, conn.rid = to, f"{id(conn):x}"
+        self._relays[conn.rid] = conn
+        log(f"[peer] {conn.peer} relayed to {to}")
+        self.relay_up(conn, {k: v for k, v in hello.items() if k != "to"})
+        return True
+
+    def relay_up(self, conn: Conn, frame: dict | None):
+        link = self.links.get(conn.via)
+        if link is None:
+            asyncio.ensure_future(conn.ws.close(4404, "link gone"))
+            return
+        self._send(link, {"type": "relay", "rid": conn.rid}
+                   | ({"frame": frame} if frame is not None else {"close": True}))
+
+    def relay_down(self, data: dict):
+        conn = self._relays.get(str(data.get("rid")))
+        if conn is None:
+            return
+        if data.get("close"):
+            asyncio.ensure_future(conn.ws.close())
+        elif isinstance(data.get("frame"), dict):
+            self._send(conn, data["frame"])
+
+    def peer_gone(self, conn: Conn):
+        if conn.via and self._relays.pop(conn.rid, None):
+            self.relay_up(conn, None)
+        if conn.peer_link and self.links.get(conn.peer_link) is conn:
+            del self.links[conn.peer_link]
+            log(f"[peer] link for {conn.peer_link} down")
+            for c in [c for c in self._relays.values() if c.via == conn.peer_link]:
+                asyncio.ensure_future(c.ws.close(4404, "link gone"))
 
     async def serve(self):
         self._loop = asyncio.get_running_loop()
@@ -323,6 +429,11 @@ class BrowserBridge:
 
         async def handler(ws):
             conn = Conn(ws, self)
+            # off this machine, with require_token on: a peer, or nothing
+            addr = ipaddress.ip_address(ws.remote_address[0])
+            local = addr.is_loopback or bool(getattr(addr, "ipv4_mapped", None)
+                                             and addr.ipv4_mapped.is_loopback)
+            conn.authed = local or not self._cfg.get("require_token")
             self._conns.add(conn)
             try:
                 await conn.reader()   # runs until this connection closes
@@ -704,7 +815,7 @@ class BrowserBridge:
         connecting or disconnecting mid-reply needs no bookkeeping
         here."""
         def conns():
-            return [c for c in list(self._conns) if c.id not in self.owned]
+            return [c for c in list(self._conns) if c.id not in self.owned and c.peer is None]
 
         def _sink(rate: int, pcm: np.ndarray):
             for conn in conns():

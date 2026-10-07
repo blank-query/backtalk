@@ -281,7 +281,25 @@ DEFAULTS = {
         # browser tab). True is the friendlier default: you might be
         # standing right at the machine when you also tap the face.
         "local_playback_on_remote_turn": True,
+        # Refuse any connection from off this machine that doesn't open
+        # with a hello carrying the peer token (see peer_token). For a
+        # bridge bound to the LAN that only peers should reach. Leave it
+        # off behind a proxy: every client then looks remote.
+        "require_token": False,
     },
+    # PEERS: another backtalk agent (a second machine's Jarvis), messaged
+    # with `python -m backtalk.say <peer> "text"`. A hello carrying the
+    # shared token (peer_token below) makes a connection a peer: its
+    # messages are tagged by the server and get their own session.
+    # {"name": {"url": "ws://host:8792", "mac": "aa:bb:..." (wake it
+    # first), "via": "name" (reach it through that peer's link, below)}}
+    "peers": {},
+    # How this agent names itself to its peers ("Pi Jarvis").
+    "peer_name": "",
+    # An outbound link to a peer's bridge, for a machine that peer can't
+    # dial (a firewall): {"url": ..., "name": "desktop"}. Kept open and
+    # re-dialed; the peer's say.py reaches this machine through it.
+    "peer_link": None,
     # THE BAREHANDS SEAM: point this at a barehands checkout's state/
     # folder and its on-screen ring becomes your agent's face — it
     # breathes while idle, spins while thinking, pulses with the voice.
@@ -340,6 +358,21 @@ DISCIPLINE = (
     "phrase to SAY. Editing backtalk.json only changes the default "
     "for the NEXT launch."
 )
+
+
+def peer_token() -> str:
+    """The shared peer secret: env JARVIS_PEER_TOKEN, else the desktop
+    keyring (secret-tool, service jarvis-peer user token), else ""
+    (no peers)."""
+    tok = os.environ.get("JARVIS_PEER_TOKEN", "").strip()
+    if tok:
+        return tok
+    try:
+        import subprocess
+        return subprocess.run(["secret-tool", "lookup", "service", "jarvis-peer", "user", "token"],
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def _expand(p: str) -> str:

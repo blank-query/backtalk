@@ -111,6 +111,15 @@ _SESSION_PROMPT = (
     "brief. When the purpose is done (the person says so), end that reply with "
     "<<session end>> to hand the device back.")
 
+# What a peer session is told instead (see _peer_turn).
+_PEER_PROMPT = (
+    "\n\nTHIS IS A PEER SESSION, not the main one. Every message here comes from "
+    "{peer}, the other Jarvis, over the authenticated peer link (your CLAUDE.md "
+    "says how to treat it), and your replies go back to it as text. Start every "
+    "reply with <<quiet>> and skip the welcome line. Do the task within this turn, "
+    "no background tasks (the other side waits for this turn to end), then reply "
+    "with the full result.")
+
 # ---- THE SPOKEN PERMISSION GATE (permission_mode "ask", the default).
 # When the agent wants a gated tool, the SDK routes the decision here:
 # the ask is spoken, the turn pauses (the SDK waits indefinitely; the
@@ -1239,15 +1248,8 @@ async def amain():
                     if cid in sessions:
                         raise RuntimeError(f"{bridge.name_of(cid)} already has a dedicated session")
                     name = bridge.name_of(cid)
-                    bus = signals.DeviceBus(cid)
-                    m = Mouth(bus=bus, local=False)
-                    b = WarmBrain(model=brain.model, mouth=m, bus=bus, persist=False,
-                                  label=f"Jarvis@{name}",
-                                  append=_SESSION_PROMPT.format(purpose=a.get("purpose", "?"),
-                                                                device=name))
-                    b._can_use_tool = make_permission_gate(m, b)
-                    b.remote_sink = bridge.make_sink(conn)
-                    await b.start()
+                    b = await _new_session(conn, _SESSION_PROMPT.format(
+                        purpose=a.get("purpose", "?"), device=name))
                     sessions[cid] = b
                     if a.get("hands_free"):
                         # hands busy (cooking): open mic, no idle timeout,
@@ -1262,6 +1264,38 @@ async def amain():
                     log(f"[session] not started: {e!r}")
                     brain_for(asker).ask(f"[Dedicated session not started: {e!r}]", asker)
             asyncio.run_coroutine_threadsafe(run(), loop)
+
+        async def _new_session(conn, append: str):
+            """A dedicated session's brain for this device, started."""
+            bus = signals.DeviceBus(conn.id)
+            m = Mouth(bus=bus, local=False)
+            b = WarmBrain(model=brain.model, mouth=m, bus=bus, persist=False,
+                          label=f"Jarvis@{bridge.name_of(conn.id)}", append=append)
+            b._can_use_tool = make_permission_gate(m, b)
+            b.remote_sink = bridge.make_sink(conn)
+            await b.start()
+            return b
+
+        peer_lock = asyncio.Lock()
+
+        async def _peer_turn(conn, text: str):
+            """A message from a peer agent (web.py's PEERS): to its own
+            session, started on its first message and kept, so a long peer
+            task never holds up the main conversation. The tag comes from
+            the server's token check, never from the message text."""
+            log(f"[peer] {conn.peer}: {text[:200]}")
+            try:
+                async with peer_lock:
+                    if conn.id not in sessions:
+                        sessions[conn.id] = await _new_session(conn, _PEER_PROMPT.format(peer=conn.peer))
+                        log(f"[session] peer session started for {conn.peer}")
+            except Exception as e:
+                log(f"[peer] session not started: {e!r}")
+                sink = bridge.make_sink(conn)
+                sink.send({"type": "line", "who": "jarvis", "text": f"[peer session not started: {e!r}]"})
+                sink.send({"type": "turn_done"})
+                return
+            sessions[conn.id].ask(f"[from {conn.peer}, peer agent] {text}", bridge.make_sink(conn))
 
         def _call(arg: str, asker):
             """<<call {"to": name}>>: an intercom call from the asking
@@ -1453,6 +1487,13 @@ async def amain():
             bridge.owned = sessions
             brain.remote_sink = bridge.make_broadcast_sink()
             asyncio.create_task(bridge.serve())
+            if CFG.get("peer_link"):
+                from backtalk.config import peer_token
+                from backtalk.say import link
+                asyncio.create_task(link(CFG["peer_link"]["url"], CFG["peer_link"]["name"],
+                                         f"ws://127.0.0.1:{CFG['web'].get('port', 8792)}",
+                                         await loop.run_in_executor(None, peer_token),
+                                         CFG.get("peer_name") or NAME))
         ptt = PTTListener(CFG["ptt_key"])
         press_fut: asyncio.Future | None = None
         mic_fut: asyncio.Future | None = None
@@ -1527,6 +1568,9 @@ async def amain():
                 waiters, return_when=asyncio.FIRST_COMPLETED)
             if hf_fut is not None and hf_fut in done:
                 conn, text, typed, who = hf_fut.result(); hf_fut = None
+                if conn.peer:
+                    asyncio.ensure_future(_peer_turn(conn, text))
+                    continue
                 if typed:
                     # Typed in the face's terminal, or ("spoken") transcribed
                     # on the phone itself for a push to talk: no listening
