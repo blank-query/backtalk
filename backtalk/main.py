@@ -115,10 +115,11 @@ _SESSION_PROMPT = (
 _PEER_PROMPT = (
     "\n\nTHIS IS A PEER SESSION, not the main one. Every message here comes from "
     "{peer}, the other Jarvis, over the authenticated peer link (your CLAUDE.md "
-    "says how to treat it), and your replies go back to it as text. Start every "
-    "reply with <<quiet>> and skip the welcome line. Do the task within this turn, "
-    "no background tasks (the other side waits for this turn to end), then reply "
-    "with the full result.")
+    "says how to treat it). Your reply text goes back to it verbatim, so write only "
+    "the answer: no preamble, no remarks about these instructions, no welcome line. "
+    "Open every reply with <<quiet>> (replies here are text, never spoken). Do the "
+    "task within this turn, no background tasks (the other side waits for this turn "
+    "to end), then give the full result.")
 
 # ---- THE SPOKEN PERMISSION GATE (permission_mode "ask", the default).
 # When the agent wants a gated tool, the SDK routes the decision here:
