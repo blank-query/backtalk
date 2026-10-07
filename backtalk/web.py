@@ -310,6 +310,13 @@ class Conn:
                     if self.bridge._lines.get(self.id):
                         await self.ws.send(json.dumps(
                             {"type": "lines", "lines": list(self.bridge._lines[self.id])}))
+                    # Hands-free survives a reconnect; anything else is told
+                    # it's off, or a client still in hands-free from before a
+                    # restart streams to a server that drops it all.
+                    if self.id in self.bridge._hf_ids:
+                        self.bridge.set_listening(self, True, muted=self.bridge._hf_ids[self.id])
+                    else:
+                        await self.ws.send(json.dumps({"type": "listen", "on": False, "muted": False}))
                 elif kind == "text" and self.bridge.on_text is not None:
                     t = str(data.get("text") or "").strip()[:4000]
                     if t:
@@ -387,7 +394,7 @@ class BrowserBridge:
         # Devices in hands-free, by the browser's own token, so a reload
         # or reconnect comes back listening. Memory only: a voice-line
         # restart returns every browser to push-to-talk.
-        self._hf_ids: set[str] = set()
+        self._hf_ids: dict[str, bool] = {}     # ...and whether paused
         self.on_listen = None   # main.py: start a listener for a Conn
         self.on_image = None    # main.py: (Conn, jpeg bytes), a shared picture
         self.on_phone_result = None   # main.py: (Conn, text) from a phone command
@@ -512,9 +519,9 @@ class BrowserBridge:
         conn.active = time.monotonic()      # the hands-free idle clock
         if conn.id:
             if on:
-                self._hf_ids.add(conn.id)
+                self._hf_ids[conn.id] = conn.listen_muted
             else:
-                self._hf_ids.discard(conn.id)
+                self._hf_ids.pop(conn.id, None)
         if not on:
             while not conn._listen_q.empty():
                 conn._listen_q.get_nowait()
