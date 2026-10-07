@@ -85,6 +85,10 @@ ENROLL_S = 45      # seconds of speech an <<enroll>> collects before it says don
 ANNOUNCE_LULL_S = 1.5   # quiet needed on a device before an announcement plays
 
 
+IGNORED = "\0ignored"    # _who's verdict on another agent's voice
+PHONE_GRACE_S = 3.0      # how long after an utterance the phone's words may lag it
+
+
 def _corrected(text: str) -> str:
     """A device's own transcript gets the same name fixes the Pi's do."""
     for pattern, fix in CFG.get("stt_corrections") or []:
@@ -1132,10 +1136,16 @@ async def amain():
             shared ones), else the voiceprint, else "voice unknown". A clip
             too short to print goes to whoever spoke last here, within two
             minutes. While enrolling, every print goes to that person, and
-            the agent hears when enough speech is in. Runs off the loop."""
+            the agent hears when enough speech is in. IGNORED: a voice to
+            ignore (another agent's), checked before anything else, owned
+            devices included. Runs off the loop."""
             owner = bridge.devices().get(conn.id, {}).get("owner")
             e = voiceprint.embed(pcm)
             enroll = getattr(conn, "enroll", None)
+            hit = voiceprint.ignored(e, conn.id) if e is not None and not enroll else None
+            if hit:
+                log(f"[voice] {hit[0]} ({hit[1]:.2f}) on {bridge.name_of(conn.id)}, ignored")
+                return IGNORED
             if enroll and e is not None:
                 voiceprint.add(enroll["name"], conn.id, e)
                 enroll["s"] += len(pcm) / voiceprint.RATE
@@ -1163,6 +1173,31 @@ async def amain():
             if who:
                 conn.last_who = (who, time.monotonic())
             return who or "voice unknown"
+
+        def _heard(conn, text):
+            """Hands-free words the phone transcribed itself: through the
+            same hands-free path as the Pi's own (paused, quit phrases)."""
+            if not conn.listening or conn.disconnected:
+                return
+            pcm = conn.heard_pcm()
+
+            def work():
+                who = _who(conn, pcm)
+                if who is IGNORED:
+                    log(f"[web] another agent's voice, dropped: {text[:60]!r}")
+                    return
+                log("[ears] transcribed on the device (hands-free)")
+                loop.call_soon_threadsafe(hf_q.put_nowait, (conn, _corrected(text), False, who))
+            threading.Thread(target=work, daemon=True).start()
+
+        def _phone_had_it(conn, span) -> bool:
+            """The phone's recognizer hears this stream too: wait until its
+            words for this utterance would have arrived, and say whether
+            they did. Times are arrival times, so a listener running behind
+            the stream waits less, not wrongly."""
+            began, ended = span
+            time.sleep(max(0.0, ended + PHONE_GRACE_S - time.monotonic()))
+            return conn.heard_at >= began - 0.5
 
         def _enroll(arg: str, asker):
             """<<enroll {"name": ...}>>: this device's next ENROLL_S
@@ -1417,7 +1452,15 @@ async def amain():
                         time.sleep(1)
                         continue
                     if text and not stop():
+                        if conn.phone_stt:
+                            if _phone_had_it(conn, hf_ears.last_span):
+                                log(f"[ears] the phone had it, dropped the Pi's: {text[:60]!r}")
+                                continue
+                            log("[ears] the phone heard nothing, using the Pi's transcript")
                         who = _who(conn, hf_ears.last_pcm)
+                        if who is IGNORED:
+                            log(f"[web] another agent's voice, dropped: {text[:60]!r}")
+                            continue
                         loop.call_soon_threadsafe(hf_q.put_nowait,
                                                   (conn, text, False, who))
             conn.hf_thread = threading.Thread(target=work, daemon=True)
@@ -1478,6 +1521,7 @@ async def amain():
             bridge.on_listen = _hf_listen
             bridge.on_image = _on_image
             bridge.on_phone_result = _on_phone_result
+            bridge.on_heard = _heard
             bridge.on_text = lambda conn, t, spoken=False: hf_q.put_nowait(
                 (conn, t, "spoken" if spoken else True,
                  bridge.devices().get(conn.id, {}).get("owner")))
@@ -1703,6 +1747,8 @@ async def amain():
                                 if pcm is not None else None)
                     who = (await loop.run_in_executor(None, _who, conn, pcm)
                            if text else None)
+                    if who is IGNORED:
+                        who = None      # a press is deliberate: kept, untagged
                 except Exception as e:
                     session.cancel()
                     if explain_audio_failure(e):

@@ -555,6 +555,7 @@ class Ears:
         self.vad = webrtcvad.Vad(aggressiveness)
         self.silence_frames = silence_ms // FRAME_MS
         self.last_pcm = None     # the last utterance's audio (voiceprints)
+        self.last_span = (0.0, 0.0)   # ...when it began and ended (the stream's t, if it keeps one)
 
     def listen_once(self, gate=None, timeout_s: float | None = None,
                     abort=None, stream=None, busy=None) -> str | None:
@@ -607,6 +608,7 @@ class Ears:
                         speech_run = speech_run + 1 if is_speech else 0
                         if speech_run >= OPEN_FRAMES:
                             in_utterance = True
+                            began = getattr(stream, "t", None) or time.monotonic()
                             frames = ring[:]
                             silence_run = 0
                             if busy: busy(True)   # first, so the rings show at once
@@ -632,6 +634,7 @@ class Ears:
                                 session.cancel(); session = None
                                 if busy: busy(False)
                                 continue
+                            self.last_span = (began, getattr(stream, "t", None) or time.monotonic())
                             text = session.finish(); session = None
                             self.last_pcm = np.concatenate(frames)
                             _log_capture(self.last_pcm, capped)

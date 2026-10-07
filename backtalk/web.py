@@ -131,6 +131,17 @@ Wire protocol, deliberately tiny:
                                              outside a press feed
                                              ListenStream, and the voice
                                              line does the endpointing.
+  text frame  {"type": "stt", "on": b}      client -> server: the phone's
+                                             own recognizer is (or isn't)
+                                             hearing its hands-free stream
+  text frame  {"type": "heard", "text": ...}  client -> server: one
+                                             hands-free utterance as the
+                                             phone transcribed it (its
+                                             recognizer endpoints); the
+                                             server's own transcript of the
+                                             same speech is then dropped,
+                                             and used only when the phone
+                                             had nothing
 
 Every binary frame carries its own sample rate rather than assuming
 16000, because a browser's actual capture rate is a cross-browser
@@ -216,9 +227,23 @@ class Conn:
         self.relayed_at = 0.0   # when call audio last went to this device
         # Read from a worker thread (ListenStream), hence queue.Queue.
         # Bounded: a stalled listener drops audio, never memory.
-        self._listen_q: "queue.Queue[bytes]" = queue.Queue(maxsize=500)
+        self._listen_q: "queue.Queue[tuple[float, bytes]]" = queue.Queue(maxsize=500)
+        self.phone_stt = False   # the phone's recognizer hears the hands-free stream
+        self.heard_at = 0.0      # when its last words ("heard") arrived
+        # The last few seconds of hands-free audio as it arrived, (time,
+        # frame): the voiceprint for the phone's words.
+        self.recent: "collections.deque[tuple[float, bytes]]" = collections.deque(maxlen=100)
         self._frames: "asyncio.Queue" = asyncio.Queue()
         self._released = asyncio.Event()
+
+    def heard_pcm(self, s: float = 6.0):
+        """The audio before the phone's last words, for their voiceprint.
+        ponytail: a fixed window (the phone gives no timings), so it can
+        hold silence or the end of earlier speech; fine for spotting a voice."""
+        pcm = [f[4:] for t, f in list(self.recent)
+               if self.heard_at - s <= t <= self.heard_at
+               and len(f) > 4 and struct.unpack_from("<I", f, 0)[0] == 16000]
+        return np.frombuffer(b"".join(pcm), dtype=np.int16) if pcm else None
 
     async def reader(self):
         """The only loop that ever reads this connection's socket."""
@@ -235,8 +260,11 @@ class Conn:
                     elif self.recording:
                         await self._frames.put(bytes(msg))
                     elif self.listening:
+                        item = (time.monotonic(), bytes(msg))
+                        if self.phone_stt:
+                            self.recent.append(item)
                         try:
-                            self._listen_q.put_nowait(bytes(msg))
+                            self._listen_q.put_nowait(item)
                         except queue.Full:
                             pass
                     continue
@@ -290,6 +318,15 @@ class Conn:
                         self.bridge.on_text(self, t, bool(data.get("spoken")))
                     if self.id in self.bridge._hf_ids:
                         self.bridge.set_listening(self, True)
+                elif kind == "stt":
+                    self.phone_stt = bool(data.get("on"))
+                    log(f"[web] phone recognizer {'on' if self.phone_stt else 'off'}"
+                        f" for {str(self.id)[:8]}")
+                elif kind == "heard" and self.bridge.on_heard is not None:
+                    t = str(data.get("text") or "").strip()[:4000]
+                    if t:
+                        self.heard_at = time.monotonic()
+                        self.bridge.on_heard(self, t)
                 elif kind == "app_get":
                     asyncio.ensure_future(self.bridge.send_update(self))
                 elif kind == "hangup" and self.call:
@@ -357,6 +394,7 @@ class BrowserBridge:
         self.devices_file = None      # main.py: the device names (see saw)
         self.update_dir = None        # main.py: where a newer app waits (see offer_update)
         self.on_text = None           # main.py: (Conn, text) typed in the terminal
+        self.on_heard = None          # main.py: (Conn, text) hands-free words from the phone
         # Devices a dedicated session owns (main.py's sessions, by id): the
         # main session's broadcasts skip them, so its replies and stops
         # never land on, say, the kitchen mid-recipe.
@@ -844,12 +882,14 @@ class ListenStream:
     ears.Ears.listen_once(stream=...): read(n) blocks for n samples at
     RATE, resampling whatever rate the browser actually captures at.
     A gap in the audio (network stall) reads as silence after 100ms,
-    so the caller's abort check keeps getting a turn."""
+    so the caller's abort check keeps getting a turn. `t` is when the
+    newest audio read so far arrived (the listener can run behind)."""
 
     def __init__(self, conn: Conn):
         self.conn = conn
         self._buf = np.zeros(0, dtype=np.int16)
         self._state = None
+        self.t = time.monotonic()
 
     def __enter__(self):
         return self
@@ -860,8 +900,9 @@ class ListenStream:
     def read(self, n: int):
         while len(self._buf) < n:
             try:
-                chunk = self.conn._listen_q.get(timeout=0.1)
+                self.t, chunk = self.conn._listen_q.get(timeout=0.1)
             except queue.Empty:
+                self.t = time.monotonic()
                 # A gap: hand back what's here padded with silence. Waiting
                 # for the rest froze the listener mid-utterance when the tab
                 # stopped streaming (switched to push to talk), so its

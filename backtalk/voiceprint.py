@@ -93,9 +93,8 @@ def add(person: str, device: str, e: np.ndarray):
     os.replace(PATH + ".tmp", PATH)
 
 
-def identify(e: np.ndarray, device: str) -> tuple[str | None, float]:
-    """The enrolled person this print matches, with the score, or
-    (None, best score) when nobody clears voiceprint_threshold by MARGIN."""
+def _scores(e: np.ndarray, device: str) -> list[tuple[float, str]]:
+    """Every enrolled voice's score for this print, best first."""
     scores = []
     for person, by_dev in _load().items():
         here = by_dev.get(device) or []
@@ -103,13 +102,34 @@ def identify(e: np.ndarray, device: str) -> tuple[str | None, float]:
         if pool:
             c = np.mean(np.array(pool, dtype=np.float32), axis=0)
             scores.append((float(e @ (c / np.linalg.norm(c))), person))
+    return sorted(scores, reverse=True)
+
+
+def identify(e: np.ndarray, device: str) -> tuple[str | None, float]:
+    """The enrolled person this print matches, with the score, or
+    (None, best score) when nobody clears voiceprint_threshold by MARGIN."""
+    scores = _scores(e, device)
     if not scores:
         return None, 0.0
-    scores.sort(reverse=True)
     best, who = scores[0]
     ok = best >= float(CFG.get("voiceprint_threshold", 0.25)) and \
         (len(scores) == 1 or best - scores[1][0] >= MARGIN)
     return (who if ok else None), best
+
+
+def ignored(e: np.ndarray, device: str) -> tuple[str, float] | None:
+    """(voice, score) when this print is best matched by a voice to
+    ignore (ignore_voices: another agent's speech reaching a mic), else
+    None. No runner-up margin: any closer match to it than to a person
+    is enough, since answering another agent is the worse mistake."""
+    scores = _scores(e, device)
+    if scores and scores[0][1] in IGNORE \
+            and scores[0][0] >= float(CFG.get("voiceprint_threshold", 0.25)):
+        return scores[0][1], scores[0][0]
+    return None
+
+
+IGNORE = set(CFG.get("ignore_voices") or [])
 
 
 if __name__ == "__main__":
@@ -129,4 +149,10 @@ if __name__ == "__main__":
     assert identify(c, "echo")[0] is None           # a stranger
     m = (a + b) / np.linalg.norm(a + b)
     assert identify(m, "echo")[0] is None           # too close to call
+    j = rng.normal(size=192); j /= np.linalg.norm(j)
+    for _ in range(3):
+        add("desktop jarvis", "phone", j)
+    assert ignored(j, "phone")[0] == "desktop jarvis"
+    assert ignored(a, "phone") is None              # sir is never dropped
+    assert ignored(c, "phone") is None              # nor a stranger
     print("voiceprint self-check ok")

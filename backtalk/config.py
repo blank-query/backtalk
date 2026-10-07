@@ -190,6 +190,9 @@ DEFAULTS = {
     "max_utterance_s": 30,
     "voiceprint_model": "",
     "voiceprint_threshold": 0.25,
+    # Enrolled voices whose speech is dropped, never answered: another
+    # agent's voice reaching an open mic (enroll it like a person).
+    "ignore_voices": ["desktop jarvis"],
     # Debugging: a folder to save every utterance's audio to (one wav
     # each, named by time), so a mishearing can be replayed. "" = off.
     "stt_save_dir": "",
