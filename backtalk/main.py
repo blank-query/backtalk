@@ -85,6 +85,13 @@ ENROLL_S = 45      # seconds of speech an <<enroll>> collects before it says don
 ANNOUNCE_LULL_S = 1.5   # quiet needed on a device before an announcement plays
 
 
+def _corrected(text: str) -> str:
+    """A device's own transcript gets the same name fixes the Pi's do."""
+    for pattern, fix in CFG.get("stt_corrections") or []:
+        text = re.sub(pattern, fix, text, flags=re.IGNORECASE)
+    return text
+
+
 def rewind_point(pcm, pos: int, rate: int, back_s: float = 3.0) -> int:
     """Where a paused announcement resumes: about back_s before `pos`, at
     the quietest 30 ms within a second of that mark (a gap between words),
@@ -1530,9 +1537,7 @@ async def amain():
                         log("[web] quit phrase typed, ignored")
                         continue
                     if typed == "spoken":
-                        # the same name fixes the Pi's own transcripts get
-                        for pattern, fix in CFG.get("stt_corrections") or []:
-                            text = re.sub(pattern, fix, text, flags=re.IGNORECASE)
+                        text = _corrected(text)
                         log("[ears] transcribed on the device")
                     await handle(text, spoke_from=time.monotonic(),
                                  interrupt=False,
@@ -1640,10 +1645,17 @@ async def amain():
                     pcm = await bridge.record_until_release(
                         conn, abort=lambda: _MIC["gen"] != g,
                         on_audio=session.add)
-                    if pcm is None:
+                    phone = getattr(conn, "release_text", None)
+                    if pcm is None or phone:
                         session.cancel()
-                    text = (await loop.run_in_executor(None, session.finish)
-                            if pcm is not None else None)
+                    if phone:
+                        # the phone transcribed the same audio itself; the
+                        # streamed copy was only the fallback
+                        text = _corrected(phone)
+                        log("[ears] transcribed on the device")
+                    else:
+                        text = (await loop.run_in_executor(None, session.finish)
+                                if pcm is not None else None)
                     who = (await loop.run_in_executor(None, _who, conn, pcm)
                            if text else None)
                 except Exception as e:

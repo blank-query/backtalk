@@ -43,7 +43,12 @@ Wire protocol, deliberately tiny:
                                              Interrupt button: stop the
                                              current turn first, THEN
                                              record)
-  text frame  {"type": "release"}           browser -> server
+  text frame  {"type": "release"}           browser -> server (with
+                                             "text": the phone's own
+                                             transcript of the press, used
+                                             instead of transcribing the
+                                             audio, which still streams as
+                                             the fallback and voiceprint)
   binary      <uint32 LE rate><int16 LE PCM...>   either direction
   text frame  {"type": "reply_done"}        server -> browser
   text frame  {"type": "stop"}              server -> browser (an
@@ -246,6 +251,9 @@ class Conn:
                 elif kind == "interrupt_press":
                     self.bridge._on_press(self, interrupt=True)
                 elif kind == "release":
+                    # the phone's own transcript of this press, if it made
+                    # one (on-device recognition fed the same audio)
+                    self.release_text = str(data.get("text") or "").strip() or None
                     self._released.set()
                 elif kind == "unmute" and self.listen_muted:
                     self.bridge.set_listening(self, True)
@@ -340,6 +348,7 @@ class BrowserBridge:
             log("[web] press ignored, this tab is already recording")
             return
         conn.recording = True
+        conn.release_text = None
         conn._released.clear()
         while not conn._frames.empty():
             conn._frames.get_nowait()   # drop anything stale from before this press
