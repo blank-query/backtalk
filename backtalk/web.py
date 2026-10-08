@@ -342,6 +342,11 @@ class Conn:
                         self.bridge.on_heard(self, t)
                 elif kind == "reopen" and self.bridge.on_reopen is not None:
                     self.bridge.on_reopen(self, str(data.get("path") or ""))
+                elif kind == "app_status":
+                    # Android's installer on a self-update (0 installed, -1
+                    # waiting for the person, 3 cancelled, others failed)
+                    log(f"[app] {self.bridge.name_of(self.id)} install status "
+                        f"{data.get('code')} {str(data.get('message') or '')[:200]}")
                 elif kind == "app_get":
                     asyncio.ensure_future(self.bridge.send_update(self))
                 elif kind == "hangup" and self.call:
