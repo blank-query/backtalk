@@ -167,6 +167,13 @@ class WarmBrain:
         # but it WAS asked for, in advance (a cooking timer, a long
         # build): that turn goes back to the device that asked.
         self._task_owner: dict = {}
+        # Finished tasks whose follow-up turn hasn't started yet because
+        # another turn was running (ma'am chatting in the kitchen while
+        # sir's peer-link result lands): (owner, finished at). The next
+        # turn nobody dispatched takes the oldest, so it goes to the
+        # device that asked instead of every device.
+        self._owed: deque = deque()
+        self._dispatched = False     # the running turn came from ask(), not the SDK
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -236,6 +243,7 @@ class WarmBrain:
             return
         utterance, remote_sink, self._ask_t0 = self._ask_queue.popleft()
         self._turn_active = True
+        self._dispatched = True
         self._current_asker = remote_sink
         self.bus.set_active_conn(getattr(remote_sink, "conn_id", None))
         asyncio.ensure_future(self._client.query(utterance))
@@ -245,6 +253,7 @@ class WarmBrain:
         session itself was cleared/reset underneath it)."""
         self._active_tasks.clear()
         self._task_owner.clear()
+        self._owed.clear()
         self.bus.set_tasks(0)
         self.bus.set_active_conn(None)
 
@@ -599,6 +608,8 @@ class WarmBrain:
                                 and self._current_asker is None:
                             self._current_asker = owner
                             self.bus.set_active_conn(getattr(owner, "conn_id", None))
+                        elif owner is not None:
+                            self._owed.append((owner, time.time()))
 
                 if self._capture is not None:
                     if t == "AssistantMessage":
@@ -616,6 +627,15 @@ class WarmBrain:
                     continue
 
                 if t == "StreamEvent":
+                    if self._current_asker is None and self._owed and not self._dispatched:
+                        # a turn nobody dispatched: a finished task's
+                        # follow-up, owed to the device that started it
+                        # ponytail: oldest-first guess, fine while tasks finish in order; tag turns by task id if they don't
+                        while self._owed and time.time() - self._owed[0][1] > 900:
+                            self._owed.popleft()
+                        if self._owed:
+                            self._current_asker = self._owed.popleft()[0]
+                            self.bus.set_active_conn(getattr(self._current_asker, "conn_id", None))
                     self._turn_active = True
                     if self._discard_until_result:
                         continue
@@ -666,6 +686,7 @@ class WarmBrain:
                         self._tally(msg)
                         self._remember_session(msg)
                         self._current_asker = None
+                        self._dispatched = False
                         self._dispatch_next()
                         continue
                     self._tally(msg)
@@ -673,6 +694,7 @@ class WarmBrain:
                     await self._pull_rate_limits()
                     end_turn()
                     self._current_asker = None
+                    self._dispatched = False
                     self._dispatch_next()
         finally:
             if not nxt.done():
@@ -708,6 +730,7 @@ class WarmBrain:
         # rebuild would ever get sent.
         self._turn_active = False
         self._current_asker = None
+        self._dispatched = False
         self._dispatch_next()
         log("[brain] reader rebuilt the session after a stream error "
             "(conversation memory for this session resets)")
