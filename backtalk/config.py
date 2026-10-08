@@ -183,13 +183,14 @@ DEFAULTS = {
     # device. Path to a sherpa-onnx speaker-embedding model, e.g.
     # nemo_en_titanet_small.onnx from sherpa-onnx's
     # speaker-recongition-models release (pip install sherpa-onnx);
-    # "" = off. A match needs this cosine score (0.25 kept real voices
-    # apart with room to spare in testing).
+    # "" = off. A name needs this cosine score, and a lead over the
+    # runner-up (voiceprint.MARGIN); below either it's "voice unknown".
+    # 0.25 let noisy Kitchen clips through as the wrong person at 0.30.
     # The longest an open-mic utterance may run before it's cut off (a
     # long talker in a kitchen hit 30 s mid-thought; the Pi uses 90).
     "max_utterance_s": 30,
     "voiceprint_model": "",
-    "voiceprint_threshold": 0.25,
+    "voiceprint_threshold": 0.4,
     # Enrolled voices whose speech is dropped, never answered: another
     # agent's voice reaching an open mic (enroll it like a person).
     "ignore_voices": ["desktop jarvis"],

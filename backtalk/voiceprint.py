@@ -43,7 +43,12 @@ from backtalk.vlog import log
 RATE = 16000
 MIN_S = 1.0          # shorter clips print too unreliably to judge
 KEEP = 30            # newest prints kept per person per device
-MARGIN = 0.05        # the best match must beat the runner-up by this
+# A name needs both a score of voiceprint_threshold and this lead over the
+# runner-up. Picked from the real prints (2026-10-07): own-voice scores
+# 0.29+ (median 0.6 to 0.75), other-voice scores never above 0.23, so a
+# genuine margin is 0.21+; the Kitchen's wrong "ma'am" tags scored 0.30.
+MARGIN = 0.15
+IGNORE_MIN = 0.25    # ignore_voices: a lower bar (see ignored())
 
 _ex = None
 _lock = threading.Lock()
@@ -112,8 +117,9 @@ def identify(e: np.ndarray, device: str) -> tuple[str | None, float]:
     if not scores:
         return None, 0.0
     best, who = scores[0]
-    ok = best >= float(CFG.get("voiceprint_threshold", 0.25)) and \
-        (len(scores) == 1 or best - scores[1][0] >= MARGIN)
+    second = scores[1][0] if len(scores) > 1 else 0.0
+    ok = best >= float(CFG.get("voiceprint_threshold", 0.4)) and best - second >= MARGIN
+    log(f"[voice] best {who} {best:.2f}, runner-up {second:.2f}")
     return (who if ok else None), best
 
 
@@ -124,7 +130,7 @@ def ignored(e: np.ndarray, device: str) -> tuple[str, float] | None:
     is enough, since answering another agent is the worse mistake."""
     scores = _scores(e, device)
     if scores and scores[0][1] in IGNORE \
-            and scores[0][0] >= float(CFG.get("voiceprint_threshold", 0.25)):
+            and scores[0][0] >= IGNORE_MIN:
         return scores[0][1], scores[0][0]
     return None
 
@@ -147,6 +153,8 @@ if __name__ == "__main__":
     assert identify(b, "echo")[0] == "maam"
     c = rng.normal(size=192); c /= np.linalg.norm(c)
     assert identify(c, "echo")[0] is None           # a stranger
+    w = 0.35 * a + np.sqrt(1 - 0.35 ** 2) * c       # sir-ish but weak (0.35)
+    assert identify(w, "echo")[0] is None           # below the threshold
     m = (a + b) / np.linalg.norm(a + b)
     assert identify(m, "echo")[0] is None           # too close to call
     j = rng.normal(size=192); j /= np.linalg.norm(j)
