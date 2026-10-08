@@ -89,7 +89,13 @@ Wire protocol, deliberately tiny:
                                              device's turns only;
                                              {"type": "lines", "lines":
                                              [...]} replays the last 60
-                                             on hello
+                                             on hello. A line with
+                                             "show": {title, path} is a
+                                             card's reopen button; the
+                                             client sends {"type":
+                                             "reopen", "path": ...} and
+                                             gets the file's current
+                                             contents as a "show"
   text frame  {"type": "call", "on": b,     server -> client: an intercom
                "with": name}                 call started or ended. While
                                              on, the client streams its mic
@@ -334,6 +340,8 @@ class Conn:
                     if t:
                         self.heard_at = time.monotonic()
                         self.bridge.on_heard(self, t)
+                elif kind == "reopen" and self.bridge.on_reopen is not None:
+                    self.bridge.on_reopen(self, str(data.get("path") or ""))
                 elif kind == "app_get":
                     asyncio.ensure_future(self.bridge.send_update(self))
                 elif kind == "hangup" and self.call:
@@ -402,6 +410,7 @@ class BrowserBridge:
         self.update_dir = None        # main.py: where a newer app waits (see offer_update)
         self.on_text = None           # main.py: (Conn, text) typed in the terminal
         self.on_heard = None          # main.py: (Conn, text) hands-free words from the phone
+        self.on_reopen = None         # main.py: (Conn, path) a card's reopen button
         # Devices a dedicated session owns (main.py's sessions, by id): the
         # main session's broadcasts skip them, so its replies and stops
         # never land on, say, the kitchen mid-recipe.

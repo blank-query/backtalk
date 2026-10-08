@@ -1243,10 +1243,12 @@ async def amain():
                 log(f"[voice] enrollment not started: {e!r}")
                 loop.call_soon_threadsafe(brain_for(asker).ask, f"[Enrollment not started: {e!r}]", asker)
 
-        def _show(arg: str, asker):
+        def _show(arg: str, asker, button: bool = True):
             """<<show path/to/note.md>>: that note, whole, as a full-screen
             card on the asking device (a recipe, a list); <<show close>>
-            closes it. Only files inside the agent's folders."""
+            closes it. Only files inside the agent's folders. The reply's
+            terminal entry gets a button that reopens the file as it is
+            then (the face sends "reopen", which lands here, button off)."""
             send = getattr(asker, "send", None)
             if send is None:
                 return
@@ -1263,8 +1265,11 @@ async def amain():
                 if text.startswith("---"):           # drop the note's frontmatter
                     end = text.find("\n---", 3)
                     text = text[end + 4:].lstrip() if end > 0 else text
-                send({"type": "show", "title": os.path.splitext(os.path.basename(path))[0],
-                      "markdown": text})
+                title = os.path.splitext(os.path.basename(path))[0]
+                send({"type": "show", "title": title, "markdown": text})
+                if button:
+                    send({"type": "line", "who": "jarvis", "text": "",
+                          "show": {"title": title, "path": path}})
                 log(f"[show] {os.path.basename(path)} to {bridge.name_of(asker.conn_id)}")
             except Exception as e:
                 log(f"[show] not shown: {e!r}")
@@ -1553,6 +1558,7 @@ async def amain():
             bridge.on_image = _on_image
             bridge.on_phone_result = _on_phone_result
             bridge.on_heard = _heard
+            bridge.on_reopen = lambda conn, path: _show(path, bridge.make_sink(conn), button=False)
             bridge.on_text = lambda conn, t, spoken=False: hf_q.put_nowait(
                 (conn, t, "spoken" if spoken else True,
                  bridge.devices().get(conn.id, {}).get("owner")))
