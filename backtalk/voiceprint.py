@@ -49,6 +49,7 @@ KEEP = 30            # newest prints kept per person per device
 # genuine margin is 0.21+; the Kitchen's wrong "ma'am" tags scored 0.30.
 MARGIN = 0.15
 IGNORE_MIN = 0.25    # ignore_voices: a lower bar (see ignored())
+WINDOW_S = 1.5       # slices judged separately by speakers()
 
 _ex = None
 _lock = threading.Lock()
@@ -110,17 +111,39 @@ def _scores(e: np.ndarray, device: str) -> list[tuple[float, str]]:
     return sorted(scores, reverse=True)
 
 
-def identify(e: np.ndarray, device: str) -> tuple[str | None, float]:
-    """The enrolled person this print matches, with the score, or
-    (None, best score) when nobody clears voiceprint_threshold by MARGIN."""
-    scores = _scores(e, device)
+def _pick(scores) -> tuple[str | None, float, float]:
+    """(name or None, best, runner-up): a name needs voiceprint_threshold
+    and a MARGIN lead."""
     if not scores:
-        return None, 0.0
+        return None, 0.0, 0.0
     best, who = scores[0]
     second = scores[1][0] if len(scores) > 1 else 0.0
     ok = best >= float(CFG.get("voiceprint_threshold", 0.4)) and best - second >= MARGIN
-    log(f"[voice] best {who} {best:.2f}, runner-up {second:.2f}")
-    return (who if ok else None), best
+    return (who if ok else None), best, second
+
+
+def identify(e: np.ndarray, device: str) -> tuple[str | None, float]:
+    """The enrolled person this print matches, with the score, or
+    (None, best score) when nobody clears voiceprint_threshold by MARGIN."""
+    who, best, second = _pick(_scores(e, device))
+    if best:
+        log(f"[voice] best {who or 'nobody'} {best:.2f}, runner-up {second:.2f}")
+    return who, best
+
+
+def speakers(pcm: np.ndarray, device: str) -> list[str]:
+    """Every enrolled person (not ignore_voices) clearly heard in this
+    audio, judging each WINDOW_S slice on its own, in order of first
+    appearance. Two names = two people talking to each other."""
+    n, found = int(RATE * WINDOW_S), []
+    if pcm is None or not enabled():
+        return found
+    for i in range(0, len(pcm) - n + 1, n):
+        e = embed(pcm[i:i + n])
+        who = _pick(_scores(e, device))[0] if e is not None else None
+        if who and who not in IGNORE and who not in found:
+            found.append(who)
+    return found
 
 
 def ignored(e: np.ndarray, device: str) -> tuple[str, float] | None:
@@ -163,4 +186,10 @@ if __name__ == "__main__":
     assert ignored(j, "phone")[0] == "desktop jarvis"
     assert ignored(a, "phone") is None              # sir is never dropped
     assert ignored(c, "phone") is None              # nor a stranger
+    CFG["voiceprint_model"] = "fake"                 # speakers(): a fake model,
+    embed = lambda pcm: a if pcm[0] > 0 else b      # sir or maam by the slice's sign
+    n = int(RATE * WINDOW_S)
+    two = np.concatenate([np.ones(n), -np.ones(n), np.ones(n // 2)])
+    assert speakers(two, "echo") == ["sir", "maam"]
+    assert speakers(np.ones(3 * n), "echo") == ["sir"]
     print("voiceprint self-check ok")

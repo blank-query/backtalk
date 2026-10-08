@@ -416,6 +416,15 @@ def console_match(text):
     return None
 
 
+def says_name(text):
+    """The agent's name anywhere in the text, close mishearings ("Javi")
+    included."""
+    words, name = _norm_speech(text).split(), " ".join(NAME.lower().split())
+    k = len(name.split())
+    return any(SequenceMatcher(None, " ".join(words[i:i + k]), name).ratio() >= 0.75
+               for i in range(len(words)))
+
+
 def trailing_mic_verb(text):
     """A listening command may also END a longer utterance, as its own
     sentence: "That worked. Jarvis, pause." -> ("micmute", "That
@@ -1174,6 +1183,23 @@ async def amain():
                 conn.last_who = (who, time.monotonic())
             return who or "voice unknown"
 
+        def _crosstalk(conn, pcm, text) -> bool:
+            """Two enrolled people in one hands-free clip are talking to
+            each other, not to the agent (sir, 2026-10-07): drop it,
+            unless it names the agent."""
+            if says_name(text) or getattr(conn, "enroll", None):
+                return False
+            try:
+                heard = voiceprint.speakers(pcm, conn.id)
+            except Exception as e:
+                log(f"[voice] crosstalk check skipped: {e!r}")
+                return False
+            if len(heard) < 2:
+                return False
+            log(f"[voice] {' and '.join(heard)} talking to each other on "
+                f"{bridge.name_of(conn.id)}, dropped: {text[:60]!r}")
+            return True
+
         def _heard(conn, text):
             """Hands-free words the phone transcribed itself: through the
             same hands-free path as the Pi's own (paused, quit phrases)."""
@@ -1185,6 +1211,8 @@ async def amain():
                 who = _who(conn, pcm)
                 if who is IGNORED:
                     log(f"[web] another agent's voice, dropped: {text[:60]!r}")
+                    return
+                if _crosstalk(conn, pcm, text):
                     return
                 log("[ears] transcribed on the device (hands-free)")
                 loop.call_soon_threadsafe(hf_q.put_nowait, (conn, _corrected(text), False, who))
@@ -1460,6 +1488,8 @@ async def amain():
                         who = _who(conn, hf_ears.last_pcm)
                         if who is IGNORED:
                             log(f"[web] another agent's voice, dropped: {text[:60]!r}")
+                            continue
+                        if _crosstalk(conn, hf_ears.last_pcm, text):
                             continue
                         loop.call_soon_threadsafe(hf_q.put_nowait,
                                                   (conn, text, False, who))
