@@ -70,8 +70,8 @@ import numpy as np
 from backtalk import signals, voiceprint
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
-from backtalk.ears import (Ears, Session, explain_audio_failure, record_held,
-                           warm as warm_ears)
+from backtalk.ears import (Ears, Session, babble, explain_audio_failure,
+                           record_held, warm as warm_ears)
 from backtalk.mouth import DIRECTION_HOOKS, Mouth, synth_stream
 from backtalk.ptt import PTTListener
 from backtalk.vlog import log
@@ -87,6 +87,7 @@ ANNOUNCE_LULL_S = 1.5   # quiet needed on a device before an announcement plays
 
 IGNORED = "\0ignored"    # _who's verdict on another agent's voice
 PHONE_GRACE_S = 3.0      # how long after an utterance the phone's words may lag it
+NOT_A_TAP_S = 1.0        # a browser press held this long that yields nothing gets "I didn't catch that."
 
 
 def _corrected(text: str) -> str:
@@ -1203,7 +1204,7 @@ async def amain():
         def _heard(conn, text):
             """Hands-free words the phone transcribed itself: through the
             same hands-free path as the Pi's own (paused, quit phrases)."""
-            if not conn.listening or conn.disconnected:
+            if not conn.listening or conn.disconnected or babble(text):
                 return
             pcm = conn.heard_pcm()
 
@@ -1746,8 +1747,10 @@ async def amain():
                     _unmute()
                 mouth.ducker.speech_end(0.2)     # snap back fast on release
                 if not text:
-                    log("[ptt] (tap or empty — ignored)")
+                    log(f"[ptt] {'tap' if text is None else 'empty transcript'}, ignored")
                     signals.set_state("idle")
+                    if text == "":      # past record_held's tap floor
+                        mouth.say("I didn't catch that.")
                     continue
                 if not await handle(text, spoke_from=press_t):
                     return
@@ -1760,10 +1763,12 @@ async def amain():
                     + ("" if is_interrupt else " (queued)"))
                 g = _MIC["gen"]
                 session = Session()
+                pcm, failed, held = None, False, 0.0
                 try:
                     pcm = await bridge.record_until_release(
                         conn, abort=lambda: _MIC["gen"] != g,
                         on_audio=session.add)
+                    held = time.monotonic() - press_t
                     phone = getattr(conn, "release_text", None)
                     if pcm is None or phone:
                         session.cancel()
@@ -1781,6 +1786,7 @@ async def amain():
                         who = None      # a press is deliberate: kept, untagged
                 except Exception as e:
                     session.cancel()
+                    failed = True
                     if explain_audio_failure(e):
                         mouth.say("I can't hear you. There's no working "
                                   "microphone I can use.")
@@ -1794,11 +1800,22 @@ async def amain():
                     _unmute()
                 mouth.ducker.speech_end(0.2)
                 if not text:
-                    log("[web] (tap or empty — ignored)")
+                    # Which failure it was (wind in a Jeep, 2026-10-05,
+                    # read as audio that transcribed to nothing).
+                    log(f"[web] press with no audio ({held:.1f}s held), ignored"
+                        if pcm is None or not len(pcm) else
+                        f"[web] empty transcript from {len(pcm) / 16000:.1f}s "
+                        f"of audio (peak {int(np.abs(pcm.astype(np.int32)).max())}), ignored")
+                    busy = mouth.speaking or brain.turn_active
                     if is_interrupt:
                         signals.set_state("idle")
                     # else: a queued tap that came up empty shouldn't
                     # stomp on whatever Jarvis is legitimately doing
+                    if (held >= NOT_A_TAP_S and not (busy or failed)
+                            and _MIC["gen"] == g):     # not cut by a mode switch
+                        # a real press, not a tap: say so, don't go silent
+                        mouth.say("I didn't catch that.",
+                                  remote_sink=bridge.make_sink(conn))
                     continue
                 if any(q in text.lower() for q in QUIT_PHRASES):
                     # A quit phrase from a tab closes only that tab:

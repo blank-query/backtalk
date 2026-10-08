@@ -94,6 +94,35 @@ _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
 # a crying baby, not a request. Open mic only.
 _WAIL = re.compile(r"(a+h*|o+h*|a+w+|o+w+|u+gh*|u+h+|u+m+|h?m+|e+w+|(ha)+h?|hm+)")
 
+
+def _looped(words: list[str]) -> bool:
+    """Over 3/4 one unit of 1-4 words said back to back 3+ times: a decoder
+    loop ("Okay. Okay. Okay..." x25) or babble ("da da da da"), whatever
+    the engine. Whisper's own fallback (below) never covered Moonshine."""
+    n = len(words)
+    for size in range(1, 5):
+        for i in range(n - 3 * size + 1):
+            reps = 1
+            while words[i + reps * size:i + (reps + 1) * size] == words[i:i + size]:
+                reps += 1
+            if reps >= 3 and 4 * reps * size > 3 * n:
+                return True
+    return False
+
+
+def babble(text: str) -> bool:
+    """An open-mic transcript that is a wail or a loop, not a request;
+    logs what it drops. Open mic only: a press is deliberate."""
+    words = re.findall(r"[a-z']+", text.lower())
+    if words and all(_WAIL.fullmatch(w) for w in words):
+        kind = "a wail"
+    elif _looped(words):
+        kind = "a loop"
+    else:
+        return False
+    log(f"[ears] ignored {kind}: {text[:60]!r}")
+    return True
+
 _model = None
 _model_lock = threading.Lock()
 _backend = None          # "mlx" once the GPU path loads, else "faster-whisper"
@@ -638,9 +667,7 @@ class Ears:
                             text = session.finish(); session = None
                             self.last_pcm = np.concatenate(frames)
                             _log_capture(self.last_pcm, capped)
-                            words = re.findall(r"[a-z']+", text.lower())
-                            if words and all(_WAIL.fullmatch(w) for w in words):
-                                log(f"[ears] ignored a wail: {text[:40]!r}")
+                            if babble(text):
                                 return ""
                             return text
         finally:
@@ -673,7 +700,18 @@ def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None
     return session.finish()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and sys.argv[1:] == ["check"]:
+    # Self-check of the open-mic babble guard (no mic or model needed).
+    for t in ["da da da da", "Da-da-da.", "Okay. " * 25, "ah ah ah",
+              "Thank you. Thank you. Thank you.", "Hands free. " * 3]:
+        assert babble(t), t
+    for t in ["What's the weather tomorrow?", "no no", "", "Very, very, very good.",
+              "I said turn it up up up please", "Jarvis, go hands free",
+              "Set a timer for ten ten minutes",
+              "Turn it up. Okay okay okay okay okay."]:   # the request survives
+        assert not babble(t), t
+    print("[ears] babble check passed")
+elif __name__ == "__main__":
     import time
     print("[ears] listening — say something...", flush=True)
     ears = Ears()
