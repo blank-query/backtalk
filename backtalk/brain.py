@@ -193,6 +193,7 @@ class WarmBrain:
                 permission_mode=sdk_mode,
                 can_use_tool=self._can_use_tool,
                 add_dirs=CFG["extra_dirs"],
+                mcp_servers=CFG["mcp_servers"],
                 skills=CFG["visible_skills"],
                 resume=rid,
                 # SDK default is 1 MB; one screenshot or gif frame blew it
@@ -697,6 +698,7 @@ class WarmBrain:
             permission_mode=("default" if CFG["permission_mode"] == "ask"
                              else CFG["permission_mode"]),
             can_use_tool=self._can_use_tool, add_dirs=CFG["extra_dirs"],
+            mcp_servers=CFG["mcp_servers"],
             skills=CFG["visible_skills"], resume=None,
             max_buffer_size=50 * 1024 * 1024))
         await self._client.connect()

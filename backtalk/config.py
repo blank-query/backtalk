@@ -86,6 +86,11 @@ DEFAULTS = {
     # Extra folders the agent may access beyond agent_dir (e.g. your
     # notes vault). Absolute paths or ~ paths.
     "extra_dirs": [],
+    # Extra MCP servers for the voice session, in the SDK's mcp_servers
+    # shape: {"name": {"command": ..., "args": [...]}}. Empty = none
+    # beyond what your Claude Code settings already load. e.g. desktop
+    # computer use (kwin-mcp) on one machine and not another.
+    "mcp_servers": {},
     # Hold-to-talk key. Named keys ("home", "f13", "right_alt", ...)
     # or a single character.
     "ptt_key": "home",
