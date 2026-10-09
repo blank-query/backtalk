@@ -78,8 +78,10 @@ def _sentence_end(buf: str):
 # <<anything>> is a stage direction: lifted out, never spoken, published on
 # the bus when the audio carrying it starts. Bounded so a runaway model
 # cannot swallow a paragraph into one "tag" (long enough for a phone
-# command's text message; see mouth.py's "phone" directions).
-_DIRECTION_TAG = re.compile(r"<<([^<>]{1,600})>>")
+# command's text message; see mouth.py's "phone" directions). A session
+# hand-off or an announcement carries a whole brief, so those two get
+# 4000 (a 1,100-character cook-with-me brief failed silently, 2026-10-09).
+_DIRECTION_TAG = re.compile(r"<<((?:session|announce) [^<>]{1,4000}|[^<>]{1,600})>>")
 def _line(sink, text: str):
     """The reply as text for the asking device's terminal (see web.py)."""
     send = getattr(sink, "send", None)
