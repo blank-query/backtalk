@@ -1047,6 +1047,12 @@ async def amain():
             _LAST_SPOKEN[0] = time.monotonic()
         if tags:
             text = f"[{', '.join(tags)}] {text}"
+        sfiles = files.pop(getattr(remote_sink, "conn_id", None), None)
+        if sfiles:
+            text = ("[The user shared a file with this message; open it with the "
+                    "Read tool or whatever suits the type: "
+                    + "; ".join(sfiles) + "] " + text)
+            remote_sink.send({"type": "image_used"})
         shared = images.pop(getattr(remote_sink, "conn_id", None), None)
         if shared:
             text = ("[The user shared an image with this message; view it "
@@ -1100,6 +1106,24 @@ async def amain():
                 f.write(data)
             images.setdefault(conn.id, []).append(p)
             log(f"[web] image from {str(conn.id)[:8]}: {p} ({len(data) // 1024} KB)")
+
+        # Any other file shared from a device (share sheet, or the
+        # terminal's + button): saved under .backtalk/files with a safe
+        # name, attached to that device's next question like a picture.
+        files: dict[str, list[str]] = {}
+
+        def _on_file(conn, name: str, mime: str, data: bytes):
+            d = os.path.join(CFG["agent_dir"], ".backtalk", "files")
+            os.makedirs(d, exist_ok=True)
+            for old in sorted(glob.glob(os.path.join(d, "*")))[:-50]:
+                os.remove(old)   # keep the last 50
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(name)).strip("._") or "file"
+            p = os.path.join(d, time.strftime("%Y%m%d-%H%M%S-") + safe[:80])
+            with open(p, "wb") as f:
+                f.write(data)
+            files.setdefault(conn.id, []).append(
+                f"{p} ({mime or 'unknown type'}, {max(1, len(data) // 1024)} KB)")
+            log(f"[web] file from {str(conn.id)[:8]}: {p} ({mime}, {len(data) // 1024} KB)")
 
         def _announce(directions, asker):
             """<<announce {"to": name, "text": ...}>>: a chime, then the
@@ -1556,6 +1580,7 @@ async def amain():
             bridge = BrowserBridge(CFG["web"])
             bridge.on_listen = _hf_listen
             bridge.on_image = _on_image
+            bridge.on_file = _on_file
             bridge.on_phone_result = _on_phone_result
             bridge.on_heard = _heard
             bridge.on_reopen = lambda conn, path: _show(path, bridge.make_sink(conn), button=False)

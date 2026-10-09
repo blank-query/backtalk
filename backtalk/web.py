@@ -69,6 +69,12 @@ Wire protocol, deliberately tiny:
                                              {"type": "image_used"} once
                                              it rides along with a
                                              question
+  text frame  {"type": "file", "name": ...,   client -> server: any other
+               "mime": ..., "data": b64}       shared file (share sheet or
+                                             the terminal's +); acked with
+                                             {"type": "file_ok", "name"},
+                                             then rides along with the
+                                             next question like an image
   text frame  {"type": "phone", "do": ...}  server -> client: a command for
                                              the device that asked (the
                                              agent's <<phone {...}>> tag;
@@ -380,6 +386,14 @@ class Conn:
                         await self.ws.send(json.dumps({"type": "image_ok"}))
                     except Exception as e:
                         log(f"[web] shared image dropped: {e}")
+                elif kind == "file" and self.bridge.on_file is not None:
+                    try:
+                        name = str(data.get("name") or "file")
+                        self.bridge.on_file(self, name, str(data.get("mime") or ""),
+                                            base64.b64decode(data.get("data") or ""))
+                        await self.ws.send(json.dumps({"type": "file_ok", "name": name}))
+                    except Exception as e:
+                        log(f"[web] shared file dropped: {e}")
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
@@ -410,6 +424,7 @@ class BrowserBridge:
         self._hf_ids: dict[str, bool] = {}     # ...and whether paused
         self.on_listen = None   # main.py: start a listener for a Conn
         self.on_image = None    # main.py: (Conn, jpeg bytes), a shared picture
+        self.on_file = None     # main.py: (Conn, name, mime, bytes), any other shared file
         self.on_phone_result = None   # main.py: (Conn, text) from a phone command
         self.devices_file = None      # main.py: the device names (see saw)
         self.update_dir = None        # main.py: where a newer app waits (see offer_update)
@@ -500,7 +515,7 @@ class BrowserBridge:
                 self._conns.discard(conn)
 
         self._server = await websockets.serve(handler, host, port,
-                                              max_size=16 * 2**20)   # shared pictures
+                                              max_size=48 * 2**20)   # shared pictures and files (~35 MB after base64)
         log(f"[web] browser bridge listening on ws://{host}:{port}")
         asyncio.ensure_future(self._update_watch())
         await self._server.wait_closed()
