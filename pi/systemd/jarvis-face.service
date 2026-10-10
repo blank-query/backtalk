@@ -1,0 +1,11 @@
+[Unit]
+Description=Jarvis face (ai-visualizer, port 8790)
+
+[Service]
+WorkingDirectory=%h/projects/Jarvis/ai-visualizer
+ExecStart=%h/projects/Jarvis/backtalk/.venv/bin/python server.py --no-open
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

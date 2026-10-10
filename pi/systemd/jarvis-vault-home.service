@@ -1,0 +1,18 @@
+# Pi Jarvis's vault lives on the home server (backups, git history, the desktop's
+# mount); this mounts it at the desktop's path. Unmounted, the folder is a
+# root-owned stub saying THE VAULT IS NOT MOUNTED. install.sh fills in @HOME@
+# and @VAULT_SRC@ (JARVIS_VAULT_SRC, user@host:/path).
+[Unit]
+Description=Jarvis vault from the home server at ~/projects/Jarvis (sshfs)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Environment="MP=@HOME@/projects/Jarvis/Jarvis Memory"
+ExecStart=/usr/bin/sshfs -f "@VAULT_SRC@" "${MP}" -o allow_other,reconnect,ServerAliveInterval=15,ServerAliveCountMax=3 -o "ssh_command=sshpass -f /etc/jarvis-vault.pass ssh -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new"
+ExecStopPost=-/bin/umount -l "${MP}"
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

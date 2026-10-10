@@ -1,0 +1,15 @@
+[Unit]
+Description=Jarvis voice line (backtalk, bridge 8792)
+After=jarvis-face.service
+
+[Service]
+EnvironmentFile=%h/.config/jarvis/jarvis.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HF_HOME=%h/jarvis-data/models/hf
+ExecStart=%h/.local/bin/jarvis-run-voice
+Restart=always
+RestartSec=3
+TimeoutStartSec=90
+
+[Install]
+WantedBy=default.target
