@@ -208,6 +208,7 @@ class WarmBrain:
                 # SDK default is 1 MB; one screenshot or gif frame blew it
                 # and wiped the session. 50 MB fits big PDFs and images.
                 max_buffer_size=50 * 1024 * 1024,
+                extra_args=CFG["cli_args"],
             )
         if resume:
             try:
@@ -724,7 +725,8 @@ class WarmBrain:
             can_use_tool=self._can_use_tool, add_dirs=CFG["extra_dirs"],
             mcp_servers=CFG["mcp_servers"],
             skills=CFG["visible_skills"], resume=None,
-            max_buffer_size=50 * 1024 * 1024))
+            max_buffer_size=50 * 1024 * 1024,
+            extra_args=CFG["cli_args"]))
         await self._client.connect()
         # The turn that broke is gone; whatever was "in flight" no
         # longer is. Without this, a dead _turn_active=True would

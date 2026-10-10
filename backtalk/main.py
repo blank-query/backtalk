@@ -72,7 +72,7 @@ from backtalk.brain import WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, Session, babble, explain_audio_failure,
                            record_held, warm as warm_ears)
-from backtalk.mouth import DIRECTION_HOOKS, Mouth, synth_stream
+from backtalk.mouth import DIRECTION_HOOKS, Mouth, synth_stream, warm as warm_mouth
 from backtalk.ptt import PTTListener
 from backtalk.vlog import log
 from backtalk.web import BrowserBridge, ListenStream, beep, chime
@@ -730,6 +730,9 @@ async def amain():
     # Warm the engines while the greeting plays: the STT model load and
     # the brain's prompt-cache toll both hide behind the spoken line.
     loop.run_in_executor(None, warm_ears)
+    # and the voice, which an empty greeting would otherwise leave to load
+    # on the first reply (seconds of silence after the text shows)
+    loop.run_in_executor(None, warm_mouth)
     # THE BRAIN CONNECT, guarded. This is the one startup step that
     # needs a signed-in Claude Code, internet, and available usage.
     # When it fails or hangs, the mouth still works, so SAY SO instead
@@ -1947,7 +1950,7 @@ def _claim_single_instance() -> bool:
     # No SO_REUSEADDR here on purpose: reuse is exactly what would let a
     # second instance bind alongside the first and defeat the whole point.
     try:
-        s.bind(("127.0.0.1", _INSTANCE_PORT))
+        s.bind(("127.0.0.1", int(CFG.get("instance_port") or _INSTANCE_PORT)))
         s.listen(1)
     except OSError:
         s.close()

@@ -83,6 +83,10 @@ DEFAULTS = {
     # screen-share away from an audience. A context filter, not a sandbox:
     # it decides what the session is TOLD about, not what it can reach.
     "visible_skills": None,
+    # The one-voice-line-per-machine lock (a bound localhost port). A second
+    # assistant (its own BACKTALK_CONFIG, no local mic or talk key in use)
+    # sets its own so it can run beside the first.
+    "instance_port": 8791,
     # Extra folders the agent may access beyond agent_dir (e.g. your
     # notes vault). Absolute paths or ~ paths.
     "extra_dirs": [],
@@ -91,6 +95,10 @@ DEFAULTS = {
     # beyond what your Claude Code settings already load. e.g. desktop
     # computer use (kwin-mcp) on one machine and not another.
     "mcp_servers": {},
+    # Extra Claude Code CLI flags, {"flag": value or null}, e.g.
+    # {"strict-mcp-config": null} so only mcp_servers above load, never the
+    # user-scope servers in ~/.claude.json.
+    "cli_args": {},
     # Hold-to-talk key. Named keys ("home", "f13", "right_alt", ...)
     # or a single character.
     "ptt_key": "home",
