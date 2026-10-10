@@ -1127,8 +1127,10 @@ async def amain():
 
         def _announce(directions, asker):
             """<<announce {"to": name, "text": ...}>>: a chime, then the
-            text in this voice, on that device only. Not delivered (no
-            such device, or it isn't connected): the agent is told."""
+            text in this voice, on that device only. With "silent": true,
+            no audio at all: just a text line in that device's terminal.
+            Not delivered (no such device, or it isn't connected): the
+            agent is told."""
             for d in directions:
                 if d.startswith("call "):
                     _call(d[5:], asker)
@@ -1152,6 +1154,11 @@ async def amain():
                     log(f"[announce] not delivered: {e}")
                     loop.call_soon_threadsafe(
                         brain_for(asker).ask, f"[Announcement not delivered: {e}]", asker)
+                    continue
+                if a.get("silent") is True:
+                    bridge.make_sink(conn).send(
+                        {"type": "line", "who": "jarvis", "text": str(a.get("text") or "")})
+                    log(f"[announce] silent to {bridge.name_of(conn.id)}: {str(a.get('text'))[:120]}")
                     continue
                 threading.Thread(target=_play_announcement, daemon=True,
                                  args=(conn, str(a.get("text") or ""))).start()
