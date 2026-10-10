@@ -394,6 +394,10 @@ CONSOLE_VERBS = {
                   "auto approve mode"),
     "ask":       ("start asking again", "ask before acting",
                   "ask for permission again"),
+    # Stops a reply from anyone, even an unknown voice (see barges_in);
+    # on its own it does nothing else.
+    "stop":      ("stop", "stop talking", "enough", "that s enough",
+                  "shut up", "hold on", "hang on", "be quiet", "quiet"),
 }
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
@@ -424,6 +428,14 @@ def says_name(text):
     k = len(name.split())
     return any(SequenceMatcher(None, " ".join(words[i:i + k]), name).ratio() >= 0.75
                for i in range(len(words)))
+
+
+def barges_in(text, heard):
+    """Hands-free speech over a reply stops it, like the Interrupt
+    button (sir, 2026-10-10), when it's a stop command from anyone, or
+    exactly one enrolled voice is heard. Two voices (people talking to
+    each other) or only unknown ones: the reply carries on."""
+    return console_match(text) == "stop" or len(heard) == 1
 
 
 def trailing_mic_verb(text):
@@ -1215,22 +1227,23 @@ async def amain():
                 conn.last_who = (who, time.monotonic())
             return who or "voice unknown"
 
-        def _crosstalk(conn, pcm, text) -> bool:
-            """Two enrolled people in one hands-free clip are talking to
-            each other, not to the agent (sir, 2026-10-07): drop it,
-            unless it names the agent."""
-            if says_name(text) or getattr(conn, "enroll", None):
-                return False
+        def _crosstalk(conn, pcm, text) -> list | None:
+            """The enrolled voices in a hands-free clip (for barges_in), or
+            None to drop it: two enrolled people are talking to each
+            other, not to the agent (sir, 2026-10-07), unless it names
+            the agent."""
+            if getattr(conn, "enroll", None):
+                return []
             try:
                 heard = voiceprint.speakers(pcm, conn.id)
             except Exception as e:
                 log(f"[voice] crosstalk check skipped: {e!r}")
-                return False
-            if len(heard) < 2:
-                return False
+                return []
+            if len(heard) < 2 or says_name(text):
+                return heard
             log(f"[voice] {' and '.join(heard)} talking to each other on "
                 f"{bridge.name_of(conn.id)}, dropped: {text[:60]!r}")
-            return True
+            return None
 
         def _heard(conn, text):
             """Hands-free words the phone transcribed itself: through the
@@ -1244,10 +1257,11 @@ async def amain():
                 if who is IGNORED:
                     log(f"[web] another agent's voice, dropped: {text[:60]!r}")
                     return
-                if _crosstalk(conn, pcm, text):
+                heard = _crosstalk(conn, pcm, text)
+                if heard is None:
                     return
                 log("[ears] transcribed on the device (hands-free)")
-                loop.call_soon_threadsafe(hf_q.put_nowait, (conn, _corrected(text), False, who))
+                loop.call_soon_threadsafe(hf_q.put_nowait, (conn, _corrected(text), False, who, heard))
             threading.Thread(target=work, daemon=True).start()
 
         def _phone_had_it(conn, span) -> bool:
@@ -1526,10 +1540,11 @@ async def amain():
                         if who is IGNORED:
                             log(f"[web] another agent's voice, dropped: {text[:60]!r}")
                             continue
-                        if _crosstalk(conn, hf_ears.last_pcm, text):
+                        heard = _crosstalk(conn, hf_ears.last_pcm, text)
+                        if heard is None:
                             continue
                         loop.call_soon_threadsafe(hf_q.put_nowait,
-                                                  (conn, text, False, who))
+                                                  (conn, text, False, who, heard))
             conn.hf_thread = threading.Thread(target=work, daemon=True)
             conn.hf_thread.start()
 
@@ -1593,7 +1608,7 @@ async def amain():
             bridge.on_reopen = lambda conn, path: _show(path, bridge.make_sink(conn), button=False)
             bridge.on_text = lambda conn, t, spoken=False: hf_q.put_nowait(
                 (conn, t, "spoken" if spoken else True,
-                 bridge.devices().get(conn.id, {}).get("owner")))
+                 bridge.devices().get(conn.id, {}).get("owner"), []))
             bridge.devices_file = os.path.join(CFG["agent_dir"], ".backtalk", "devices.json")
             bridge.update_dir = os.path.join(CFG["agent_dir"], ".backtalk", "app")
             os.makedirs(os.path.dirname(bridge.devices_file), exist_ok=True)
@@ -1681,7 +1696,7 @@ async def amain():
             done, _ = await asyncio.wait(
                 waiters, return_when=asyncio.FIRST_COMPLETED)
             if hf_fut is not None and hf_fut in done:
-                conn, text, typed, who = hf_fut.result(); hf_fut = None
+                conn, text, typed, who, heard = hf_fut.result(); hf_fut = None
                 if conn.peer:
                     asyncio.ensure_future(_peer_turn(conn, text))
                     continue
@@ -1698,7 +1713,7 @@ async def amain():
                         text = _corrected(text)
                         log("[ears] transcribed on the device")
                     await handle(text, spoke_from=time.monotonic(),
-                                 interrupt=False,
+                                 interrupt=console_match(text) == "stop",
                                  remote_sink=bridge.make_sink(conn),
                                  typed=typed is True, who=who)
                     continue
@@ -1719,12 +1734,18 @@ async def amain():
                 if any(q in text.lower() for q in QUIT_PHRASES):
                     log("[web] quit phrase heard hands-free, ignored")
                     continue
-                # interrupt=False: an open mic queues behind a reply in
-                # progress rather than cutting it off; the Interrupt
-                # button is the way to stop one.
+                # Over a reply in progress, barges_in decides: stop it the
+                # way the Interrupt button does, or queue behind it.
                 conn.active = time.monotonic()
+                b = brain_for(conn)
+                cut = False
+                if b.turn_active or b.mouth.speaking:
+                    cut = barges_in(text, heard)
+                    log(f"[web] barge-in by {', '.join(heard) or 'no known voice'}: "
+                        + ("reply stopped" if cut else "reply kept, queued")
+                        + f": {text[:60]!r}")
                 await handle(text, spoke_from=time.monotonic(),
-                             interrupt=False,
+                             interrupt=cut,
                              remote_sink=bridge.make_sink(conn), who=who)
                 continue
             if typed_fut in done:

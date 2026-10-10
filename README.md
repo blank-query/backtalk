@@ -6,7 +6,7 @@ This is a fork of [jaredrhod/backtalk](https://github.com/jaredrhod/backtalk). E
 
 - **Browser bridge:** a WebSocket server (`web.py`) that the face in [this ai-visualizer fork](https://github.com/blank-query/network-ai-visualizer) connects to. Tap the face to talk; the browser records the mic and plays the reply, so the server needs no audio hardware. Set it up with the `web` block in `backtalk.json` (`enabled`, `host`, `port`).
 - **Several tabs or devices at once:** each one records independently, gets its own replies, and animates only for its own turns, all sharing one Claude Code session.
-- **Queue and Interrupt:** a tap while the agent is talking queues the next question, and the Interrupt button stops the reply, browser audio included.
+- **Queue and Interrupt:** a tap while the agent is talking queues the next question, and the Interrupt button stops the reply, browser audio included. A device's hands-free mic stops a reply too, for "Jarvis, stop" (or "stop talking", "enough", "shut up", "hold on") from anyone, or for exactly one enrolled voice talking over it; two enrolled voices or an unknown one let it carry on.
 - **Piper as an optional voice engine,** for small hardware like a Raspberry Pi where Kokoro is too slow (`piper.enabled` and `piper.model_path`, plus optional `speaker_id` and `length_scale`).
 - **Fixes along the way:** one continuous reader for the session's turn stream (replies no longer arrive one behind after background tasks), real-time pacing for browser-only replies, permission prompts that reach the browser, and a live count of background tasks for the face.
 

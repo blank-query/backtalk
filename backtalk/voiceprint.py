@@ -134,11 +134,12 @@ def identify(e: np.ndarray, device: str) -> tuple[str | None, float]:
 def speakers(pcm: np.ndarray, device: str) -> list[str]:
     """Every enrolled person (not ignore_voices) clearly heard in this
     audio, judging each WINDOW_S slice on its own, in order of first
-    appearance. Two names = two people talking to each other."""
+    appearance. Two names = two people talking to each other. A clip
+    shorter than one slice is judged whole."""
     n, found = int(RATE * WINDOW_S), []
     if pcm is None or not enabled():
         return found
-    for i in range(0, len(pcm) - n + 1, n):
+    for i in range(0, max(len(pcm) - n, 0) + 1, n):
         e = embed(pcm[i:i + n])
         who = _pick(_scores(e, device))[0] if e is not None else None
         if who and who not in IGNORE and who not in found:
@@ -192,4 +193,5 @@ if __name__ == "__main__":
     two = np.concatenate([np.ones(n), -np.ones(n), np.ones(n // 2)])
     assert speakers(two, "echo") == ["sir", "maam"]
     assert speakers(np.ones(3 * n), "echo") == ["sir"]
+    assert speakers(-np.ones(n // 2), "echo") == ["maam"]   # short: judged whole
     print("voiceprint self-check ok")
