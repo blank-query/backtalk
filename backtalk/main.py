@@ -1754,10 +1754,13 @@ async def amain():
                 press_fut.result(); press_fut = None
                 press_t = _MIC["active"] = time.monotonic()
                 await _begin_capture()
-                print("[ptt] recording (release to send)...", flush=True)
+                print("[ptt] recording (release, or tap again, to send)...", flush=True)
+                # A tap latches until the next press (record_held's 60 s
+                # caps it); while paused a tap just resumes, as on the desk.
+                on = ptt.talking(latch=not _MIC["muted"])
                 try:
                     text = await loop.run_in_executor(
-                        None, lambda: record_held(ptt.is_held))
+                        None, lambda: record_held(on))
                 except Exception as e:
                     # A device-level failure gets plain words instead of a
                     # raw exception. The pre-flight at startup cannot catch

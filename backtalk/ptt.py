@@ -18,7 +18,8 @@
 """Hold-to-talk — a global key listener.
 
 HOLD the key -> mic opens. RELEASE -> mic closes and the utterance is
-processed. The button IS the voice-activity detector, which is why this
+processed. Or TAP it (a press shorter than TAP_S): the mic stays open
+until the next press, like the desk unit (see talking()). The button IS the voice-activity detector, which is why this
 mode is speaker-safe with no headphones: the mic simply isn't open while
 the assistant talks, unless you press the key — and pressing while it
 talks interrupts it.
@@ -47,6 +48,8 @@ import threading
 import time
 
 from pynput import keyboard
+
+TAP_S = 0.35     # a press released sooner than this latches the mic on
 
 
 def resolve_key(name: str):
@@ -85,6 +88,7 @@ class PTTListener:
         self._key = resolve_key(key) if isinstance(key, str) else key
         self._held = False
         self._release_t = None          # a release awaiting confirmation
+        self._press_t = self._last_release = 0.0
         self._press_evt = threading.Event()
         self._listener = keyboard.Listener(on_press=self._on_press,
                                            on_release=self._on_release)
@@ -99,6 +103,7 @@ class PTTListener:
         self._release_t = None
         if not self._held:                      # filter key-repeat
             self._held = True
+            self._press_t = time.monotonic()
             self._press_evt.set()
 
     def _on_release(self, k):
@@ -112,6 +117,7 @@ class PTTListener:
         if self._held and r is not None and \
                 time.monotonic() - r >= self.RELEASE_GRACE:
             self._held = False
+            self._last_release = r
             self._release_t = None
 
     def wait_press(self):
@@ -129,3 +135,50 @@ class PTTListener:
     def is_held(self) -> bool:
         self._settle()
         return self._held
+
+    def talking(self, latch=True):
+        """The record-while predicate for one press (call right after
+        wait_press): True while the key is held, as before. A press
+        released within TAP_S instead latches it on until the next
+        press, which ends it (tap to start, tap again to send) and is
+        consumed so it doesn't start a recording of its own. The
+        caller's max_s still caps a forgotten latch."""
+        latched = False
+
+        def on():
+            nonlocal latched
+            if latched:
+                if self._press_evt.is_set():
+                    self._press_evt.clear()
+                    return False
+                return True
+            if self.is_held():
+                return True
+            latched = latch and self._last_release - self._press_t < TAP_S
+            return latched
+        return on
+
+
+if __name__ == "__main__":
+    # Self-check of the tap/hold logic (no keyboard needed): fake key
+    # events with a zero release grace.
+    p = object.__new__(PTTListener)
+    p._key, p._held, p._release_t = "k", False, None
+    p._press_t = p._last_release = 0.0
+    p._press_evt = threading.Event()
+    p.RELEASE_GRACE = 0
+    p._on_press("k"); p.wait_press(); on = p.talking()
+    assert on()                              # held
+    time.sleep(TAP_S + 0.05); p._on_release("k")
+    assert not on()                          # a long hold ends on release
+    p._on_press("k"); p.wait_press(); on = p.talking()
+    p._on_release("k")
+    assert on() and on()                     # a tap latches
+    p._on_press("k")
+    assert not on()                          # the next press sends
+    assert not p._press_evt.is_set()         # ...and is consumed
+    p._on_release("k"); p._settle()
+    p._on_press("k"); p.wait_press(); on = p.talking(latch=False)
+    p._on_release("k")
+    assert not on()                          # latch=False: a tap is a tap
+    print("[ptt] tap/hold check passed")
