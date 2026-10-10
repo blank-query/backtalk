@@ -136,13 +136,14 @@ class PTTListener:
         self._settle()
         return self._held
 
-    def talking(self, latch=True):
+    def talking(self, latch=True, on_latch=None):
         """The record-while predicate for one press (call right after
         wait_press): True while the key is held, as before. A press
         released within TAP_S instead latches it on until the next
         press, which ends it (tap to start, tap again to send) and is
         consumed so it doesn't start a recording of its own. The
-        caller's max_s still caps a forgotten latch."""
+        caller's max_s still caps a forgotten latch. on_latch() runs
+        once, when a tap latches (the start beep)."""
         latched = False
 
         def on():
@@ -155,6 +156,8 @@ class PTTListener:
             if self.is_held():
                 return True
             latched = latch and self._last_release - self._press_t < TAP_S
+            if latched and on_latch:
+                on_latch()
             return latched
         return on
 
@@ -173,7 +176,9 @@ if __name__ == "__main__":
     assert not on()                          # a long hold ends on release
     p._on_press("k"); p.wait_press(); on = p.talking()
     p._on_release("k")
-    assert on() and on()                     # a tap latches
+    hits = []
+    on = p.talking(on_latch=lambda: hits.append(1))
+    assert on() and on() and hits == [1]     # a tap latches, beeps once
     p._on_press("k")
     assert not on()                          # the next press sends
     assert not p._press_evt.is_set()         # ...and is consumed

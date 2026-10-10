@@ -75,7 +75,7 @@ from backtalk.ears import (Ears, Session, babble, explain_audio_failure,
 from backtalk.mouth import DIRECTION_HOOKS, Mouth, synth_stream
 from backtalk.ptt import PTTListener
 from backtalk.vlog import log
-from backtalk.web import BrowserBridge, ListenStream, chime
+from backtalk.web import BrowserBridge, ListenStream, beep, chime
 
 NAME = CFG["name"]
 # When the last spoken (not typed) question came in, any device; see handle().
@@ -1755,12 +1755,25 @@ async def amain():
                 press_t = _MIC["active"] = time.monotonic()
                 await _begin_capture()
                 print("[ptt] recording (release, or tap again, to send)...", flush=True)
-                # A tap latches until the next press (record_held's 60 s
-                # caps it); while paused a tap just resumes, as on the desk.
-                on = ptt.talking(latch=not _MIC["muted"])
+                # A tap latches until the next press, with a beep the mic
+                # doesn't hear, capped like hands-free (hands_free_timeout_s);
+                # while paused a tap just resumes, as on the desk.
+                quiet_until = [0.0]
+
+                def _tap_beep():
+                    quiet_until[0] = time.monotonic() + 0.35   # beep + output latency
+                    try:
+                        import sounddevice as sd
+                        sd.play(beep(24000), 24000)
+                    except Exception as e:
+                        log(f"[ptt] beep failed: {e!r}")
+                on = ptt.talking(latch=not _MIC["muted"], on_latch=_tap_beep)
+                cap = float(CFG.get("hands_free_timeout_s") or 120)
                 try:
                     text = await loop.run_in_executor(
-                        None, lambda: record_held(on))
+                        None, lambda: record_held(
+                            on, max_s=cap,
+                            quiet=lambda: time.monotonic() < quiet_until[0]))
                 except Exception as e:
                     # A device-level failure gets plain words instead of a
                     # raw exception. The pre-flight at startup cannot catch

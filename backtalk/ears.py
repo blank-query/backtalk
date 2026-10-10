@@ -676,16 +676,20 @@ class Ears:
                 session.cancel()
 
 
-def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None:
+def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25,
+                quiet=None) -> str | None:
     """Hold-to-talk capture: record raw audio while is_held() is True,
     then transcribe. The button is the VAD — no endpointing. Returns
-    None for taps shorter than min_s (accidental presses)."""
+    None for taps shorter than min_s (accidental presses). While
+    quiet() is True a block goes in as silence (the tap beep)."""
     frames: list[np.ndarray] = []
     session = Session()
     try:
         with _open_mic() as stream:
             while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
                 block, _ = stream.read(FRAME_LEN)
+                if quiet and quiet():
+                    block = np.zeros_like(block)
                 frames.append(block[:, 0].copy()); session.add(frames[-1])
             # a small tail so the last word isn't clipped at release
             for _ in range(6):

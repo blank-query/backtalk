@@ -196,6 +196,12 @@ def chime(rate: int) -> np.ndarray:
     return (c * 9000).astype(np.int16)
 
 
+def beep(rate: int) -> np.ndarray:
+    """One short soft tone: a tapped push to talk is listening."""
+    t = np.arange(int(rate * 0.12)) / rate
+    return (np.sin(2 * np.pi * 660 * t) * np.sin(np.pi * t / t[-1]) * 7000).astype(np.int16)
+
+
 class Call:
     """An intercom call. The caller speaks first: their frames are held
     until one is loud enough, then the far end gets a chime, the call
