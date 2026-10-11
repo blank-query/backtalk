@@ -556,8 +556,14 @@ class WarmBrain:
                 # check liveness here: the tab may have closed in the
                 # time between being queued and this turn starting.
                 turn_sink = self._current_asker
+                # A device that dropped between asking and the reply (a
+                # watch app closing its socket) keeps its reply: the
+                # sink finds its reconnect by device id and replays the
+                # text lines then. Only an anonymous sink falls back to
+                # broadcasting, so a reply never lands on other rooms.
                 if turn_sink is not None and hasattr(turn_sink, "is_live") \
-                        and not turn_sink.is_live():
+                        and not turn_sink.is_live() \
+                        and not getattr(turn_sink, "conn_id", None):
                     turn_sink = None
                 turn_sink = turn_sink or self.remote_sink
                 # time from the ask going out to the first spoken sentence
