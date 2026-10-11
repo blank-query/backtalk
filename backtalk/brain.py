@@ -181,6 +181,9 @@ class WarmBrain:
         # device that asked instead of every device.
         self._owed: deque = deque()
         self._dispatched = False     # the running turn came from ask(), not the SDK
+        # Set when input from another device joined the running turn
+        # (brain_hermes.py's steer): its rest goes to _current_asker.
+        self._widen_turn = False
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -370,8 +373,8 @@ class WarmBrain:
         except Exception:
             pass
 
-    def ask(self, utterance: str, remote_sink=None):
-        """Queue an utterance. SENDING IS JUST SENDING: this does not
+    def ask(self, utterance: str, remote_sink=None, spoken: bool = False):
+        """Queue an utterance (`spoken` matters only to brain_hermes.py). SENDING IS JUST SENDING: this does not
         wait for or return the reply — the reader speaks it, whoever's
         turn it turns out to be. Equivalent for the caller's purposes
         to firing a query and walking away.
@@ -529,6 +532,8 @@ class WarmBrain:
 
         def emit(raw: str):
             nonlocal first, batch, pending, turn_sink, quiet
+            if self._widen_turn:
+                turn_sink, self._widen_turn = self._current_asker, False
             found = _DIRECTION_TAG.findall(raw)
             if found:
                 pending += [d.strip() for d in found if d.strip()]

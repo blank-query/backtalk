@@ -275,7 +275,9 @@ class HermesClient:
     # -- the SDK client surface --------------------------------------------
     async def query(self, text: str):
         try:
-            await self.call("prompt.submit", {"session_id": self.sid, "text": text})
+            # queued: a dispatched ask is "run after"; never let Hermes's busy
+            # mode turn it into a redirect of a turn it started on its own
+            await self.call("prompt.submit", {"session_id": self.sid, "text": text, "queued": True})
         except Exception as e:
             # no turn will come back for a refused submit: end one here, said out loud
             log(f"[brain] hermes refused the prompt: {e!r}")
@@ -312,8 +314,55 @@ class HermesClient:
             self._pump_task.cancel()
 
 
+MIDTURN = "[Message while you were working] "   # her FRIDAY.md: answer in a sentence, then act
+
+
 class HermesBrain(WarmBrain):
-    """WarmBrain with a HermesClient: everything that speaks is inherited."""
+    """WarmBrain with a HermesClient: everything that speaks is inherited.
+
+    Input that arrives mid-turn joins the live turn instead of waiting for
+    it to end (a decomp turn can run for many minutes): session.steer for
+    typed and agent input (delivered with the next tool result), and
+    session.redirect for speech (cancels the model request in flight and
+    retries with the question added; during a tool it degrades to steer).
+    Whatever the turn can't take (rejected, mid-capture, being stopped)
+    queues for the next turn as before. A stop clears that queue."""
+
+    redirects = True   # main.py: a spoken barge-in joins the turn; only a stop kills it
+
+    def ask(self, utterance: str, remote_sink=None, spoken: bool = False):
+        if self._turn_active and self._capture is None \
+                and not self._discard_until_result and not self._ask_queue:
+            asyncio.ensure_future(self._correct(utterance, remote_sink, spoken))
+            return
+        super().ask(utterance, remote_sink)
+
+    async def _correct(self, text: str, sink, spoken: bool):
+        verb = "redirect" if spoken else "steer"
+        c = self._client
+        try:
+            status = (await c.call(f"session.{verb}", {"session_id": c.sid, "text": MIDTURN + text},
+                                   timeout=10)).get("status")
+        except Exception as e:
+            status = f"failed ({str(e)[:80]})"
+        if status not in ("queued", "redirected"):
+            log(f"[brain] hermes {verb} {status}: queued for the next turn")
+            super().ask(text, sink)
+            return
+        log(f"[brain] hermes {verb}: {status}")
+        asker = self._current_asker
+        if asker is not None and getattr(sink, "conn_id", None) != getattr(asker, "conn_id", None):
+            # another device joined this turn: the rest of it goes to every device
+            self._current_asker = self.remote_sink
+            self._widen_turn = True
+
+    async def interrupt(self):
+        """Stop means stop, not "next": queued asks go too, as Hermes's own
+        session.interrupt clears its queue."""
+        if self._ask_queue:
+            log(f"[brain] stop dropped {len(self._ask_queue)} queued message(s)")
+            self._ask_queue.clear()
+        await super().interrupt()
 
     def _new_client(self):
         return HermesClient(DISCIPLINE + self._append, self._can_use_tool)

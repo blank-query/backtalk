@@ -1033,7 +1033,11 @@ async def amain():
             # Stream Redesign note's interrupt-gap fix), so gating this
             # on brain.turn_active left that whole window unstoppable.
             b = brain_for(remote_sink)
-            if b.turn_active:
+            # A brain that can redirect its live turn (Hermes) keeps
+            # working through a spoken barge-in, which joins the turn
+            # below; only a stop command kills it.
+            if b.turn_active and not (getattr(b, "redirects", False)
+                                      and console_match(text) != "stop"):
                 # The reader (brain.py) owns speaking now — interrupt()
                 # is a clean async call, nothing here to cancel-and-await.
                 log("[turn] interrupted mid-reply by new input")
@@ -1083,7 +1087,7 @@ async def amain():
         if not typed:          # typing usually means keep it quiet
             b.bus.static_start()
         _deny_pending()
-        b.ask(text, remote_sink=remote_sink)
+        b.ask(text, remote_sink=remote_sink, spoken=not typed)
         return True
 
     try:
