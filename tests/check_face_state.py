@@ -3,7 +3,8 @@
 # reply that finishes playing while a tool still runs goes back to thinking;
 # a background task's report that wakes the session after its turn ended
 # shows thinking from the CLI's init until its ResultMessage, then idle; the
-# task count tracks start and finish.
+# task count tracks start and finish; a press that came to nothing mid-turn
+# settles back to thinking (main.py's _settle_state, via mouth.busy).
 import asyncio, sys, threading
 sys.path.insert(0, __import__("os").path.join(__import__("os").path.dirname(__file__), ".."))
 from claude_agent_sdk import (ResultMessage, SystemMessage, TaskStartedMessage,
@@ -82,5 +83,13 @@ async def main():
     assert bus.state == "thinking", bus.state
     feed(res()); await tick(0.1)
     assert bus.state == "idle", bus.state
+    # what main.py's _settle_state reads after a press that came to nothing
+    # (a queued tap during a turn must hand back thinking, not "listening")
+    feed(init(), think()); await tick(0.1)
+    assert b.mouth.busy(), "turn running but busy() is False"
+    b._discard_until_result = True        # an interrupted turn doesn't count
+    assert not b.mouth.busy()
+    feed(res()); await tick(0.1)
+    assert not b.mouth.busy() and not b.turn_active
     print("OK")
 asyncio.run(main())

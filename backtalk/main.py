@@ -1629,6 +1629,14 @@ async def amain():
                                          f"ws://127.0.0.1:{CFG['web'].get('port', 8792)}",
                                          await loop.run_in_executor(None, peer_token),
                                          CFG.get("peer_name") or NAME))
+        def _settle_state():
+            """A press that came to nothing hands the face back to the
+            model: thinking if a turn is still running, idle if not (a
+            speaking reply settles it itself). A queued tap used to leave
+            "listening" up for the rest of the turn (Friday, 2026-10-10)."""
+            if not mouth.speaking:
+                signals.set_state("thinking" if mouth.busy() else "idle")
+
         ptt = PTTListener(CFG["ptt_key"])
         press_fut: asyncio.Future | None = None
         mic_fut: asyncio.Future | None = None
@@ -1833,7 +1841,7 @@ async def amain():
                 mouth.ducker.speech_end(0.2)     # snap back fast on release
                 if not text:
                     log(f"[ptt] {'tap' if text is None else 'empty transcript'}, ignored")
-                    signals.set_state("idle")
+                    _settle_state()
                     if text == "":      # past record_held's tap floor
                         mouth.say("I didn't catch that.")
                     continue
@@ -1893,10 +1901,7 @@ async def amain():
                         f"[web] empty transcript from {len(pcm) / 16000:.1f}s "
                         f"of audio (peak {int(np.abs(pcm.astype(np.int32)).max())}), ignored")
                     busy = mouth.speaking or brain.turn_active
-                    if is_interrupt:
-                        signals.set_state("idle")
-                    # else: a queued tap that came up empty shouldn't
-                    # stomp on whatever Jarvis is legitimately doing
+                    _settle_state()
                     if (held >= NOT_A_TAP_S and not (busy or failed or conn.tap_dropped)
                             and _MIC["gen"] == g):     # not cut by a mode switch
                         # a real press, not a tap: say so, don't go silent
