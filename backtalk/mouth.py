@@ -458,6 +458,7 @@ class Mouth:
         self._q: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._speaking = threading.Event()
+        self.busy = lambda: False   # the brain's turn still running (see brain.py)
         # The one persistent output stream (audio law #1).
         # Worker-thread-only — never touch from other threads.
         self._out: sd.OutputStream | None = None
@@ -559,7 +560,7 @@ class Mouth:
         self.bus.reply_done()
         self.ducker.speech_end()
         self.bus.clear_playing_conn()
-        self.bus.set_state("idle")
+        self.bus.set_state("thinking" if self.busy() else "idle")
 
     def _get_out(self, rate: int) -> sd.OutputStream:
         """The long-lived stream (audio law #1). Reopened only when the

@@ -119,6 +119,11 @@ class WarmBrain:
         # The mouth the reader speaks every turn through. Set once at
         # construction; main.py owns the Mouth instance's lifetime.
         self.mouth = mouth
+        # The face follows the MODEL, not just the speech: a reply that
+        # finishes playing mid-turn (a tool still running) goes back to
+        # thinking, not idle. A turn being discarded doesn't count.
+        if mouth is not None:
+            mouth.busy = lambda: self._turn_active and not self._discard_until_result
         # Fallback sink for a turn nobody specific asked for (a
         # background report); main.py sets this once to a broadcast
         # sink reaching every connected browser. A turn that WAS asked
@@ -598,10 +603,9 @@ class WarmBrain:
                 self.mouth.say_chunk("", pending, self._current_asker if first else turn_sink)
             if first or quiet:
                 # Zero sentences yielded (brain error / empty turn), or a
-                # text-only reply: park the bus rather than leave it on
-                # "thinking" forever.
+                # text-only reply: no speech to stop the thinking sound.
+                # The state itself is settled after the next dispatch.
                 self.bus.static_stop()
-                self.bus.set_state("idle")
             # The turn is over, spoken or not: a quiet reply has no
             # reply_done, and a peer agent waits on this (see say.py).
             send = getattr(turn_sink if not first else (self._current_asker or self.remote_sink),
@@ -657,6 +661,18 @@ class WarmBrain:
                             self.bus.set_active_conn(getattr(owner, "conn_id", None))
                         elif owner is not None:
                             self._owed.append((owner, time.time()))
+
+                if not self._turn_active and (
+                        t in ("StreamEvent", "AssistantMessage", "UserMessage")
+                        or getattr(msg, "subtype", None) == "init"):
+                    # A turn nobody here started: a background task's or
+                    # subagent's report, a queued message. The CLI opens
+                    # every turn with an init, so the face shows thinking
+                    # from the request on, not idle while the model works
+                    # (Friday, 2026-10-10).
+                    self._turn_active = True
+                    if not (self.mouth and self.mouth.speaking):
+                        self.bus.set_state("thinking")
 
                 if self._capture is not None:
                     if t == "AssistantMessage":
@@ -736,6 +752,8 @@ class WarmBrain:
                         self._current_asker = None
                         self._dispatched = False
                         self._dispatch_next()
+                        if self._turn_active:     # else leave it: a barge-in may be listening
+                            self.bus.set_state("thinking")
                         continue
                     self._tally(msg)
                     self._remember_session(msg)
@@ -744,6 +762,10 @@ class WarmBrain:
                     self._current_asker = None
                     self._dispatched = False
                     self._dispatch_next()
+                    # The model is done unless a queued ask just went out;
+                    # a reply still playing settles it when it ends (mouth).
+                    if not (self.mouth and self.mouth.speaking):
+                        self.bus.set_state("thinking" if self._turn_active else "idle")
         finally:
             if not nxt.done():
                 nxt.cancel()
