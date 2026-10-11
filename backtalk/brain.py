@@ -50,9 +50,14 @@ from collections import deque
 from datetime import datetime
 
 from claude_agent_sdk import (
-    ClaudeAgentOptions, ClaudeSDKClient, TERMINAL_TASK_STATUSES,
+    ClaudeAgentOptions, ClaudeSDKClient, SystemMessage,
     TaskNotificationMessage, TaskStartedMessage, TaskUpdatedMessage,
 )
+
+# Allowlist, not the SDK's TERMINAL_TASK_STATUSES denylist: any status
+# outside these (killed, stopped, cancelled, one a future CLI invents) ends
+# the task, so an unrecognised word can never leave a ghost satellite.
+LIVE_TASK_STATUSES = frozenset({"pending", "running", "paused"})
 
 try:
     from claude_agent_sdk import CanUseToolShadowedWarning
@@ -641,7 +646,18 @@ class WarmBrain:
                 nxt = asyncio.ensure_future(stream.__anext__())
                 t = type(msg).__name__
 
-                if isinstance(msg, TaskStartedMessage):
+                if isinstance(msg, SystemMessage) \
+                        and msg.subtype == "background_tasks_changed":
+                    # The CLI's level signal: the full live background set
+                    # on every membership change (REPLACE semantics, per its
+                    # schema), so a bookend that never came (TaskStop, a
+                    # shell that just exited, a stop by the user) can't
+                    # leave a ghost. Ambient tasks are CLI housekeeping.
+                    self._active_tasks = {
+                        t["task_id"] for t in msg.data.get("tasks") or []
+                        if t.get("task_id") and not t.get("ambient")}
+                    self.bus.set_tasks(len(self._active_tasks))
+                elif isinstance(msg, TaskStartedMessage):
                     self._active_tasks.add(msg.task_id)
                     self.bus.set_tasks(len(self._active_tasks))
                     if self._current_asker is not None:
@@ -653,7 +669,7 @@ class WarmBrain:
                     # SDK versions — check both spots, see the class docs.
                     status = getattr(msg, "status", None) \
                         or (getattr(msg, "patch", None) or {}).get("status")
-                    if status in TERMINAL_TASK_STATUSES:
+                    if status is not None and status not in LIVE_TASK_STATUSES:
                         self._active_tasks.discard(msg.task_id)
                         self.bus.set_tasks(len(self._active_tasks))
                         # The turn this finish triggers comes next: owe it
@@ -800,6 +816,9 @@ class WarmBrain:
             max_buffer_size=50 * 1024 * 1024,
             extra_args=CFG["cli_args"]))
         await self._client.connect()
+        # A new CLI process: its task level starts empty and nothing
+        # reports the old process's tasks again.
+        self.clear_tasks()
         # The turn that broke is gone; whatever was "in flight" no
         # longer is. Without this, a dead _turn_active=True would
         # wedge _dispatch_next forever, and nothing queued after a
