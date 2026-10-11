@@ -71,7 +71,7 @@ from backtalk import signals, voiceprint
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, Session, babble, explain_audio_failure,
-                           record_held, warm as warm_ears)
+                           record_held, warm as warm_ears, Endpoint)
 from backtalk.mouth import DIRECTION_HOOKS, Mouth, synth_stream, warm as warm_mouth
 from backtalk.ptt import PTTListener
 from backtalk.vlog import log
@@ -1789,10 +1789,13 @@ async def amain():
                 # A tap latches until the next press, with a beep the mic
                 # doesn't hear, capped like hands-free (hands_free_timeout_s);
                 # while paused a tap just resumes, as on the desk.
+                # It also ends itself on silence after speech, like hands-free.
                 quiet_until = [0.0]
+                ep = [None]
 
                 def _tap_beep():
                     quiet_until[0] = time.monotonic() + 0.35   # beep + output latency
+                    ep[0] = Endpoint()
                     try:
                         import sounddevice as sd
                         sd.play(beep(24000), 24000)
@@ -1804,7 +1807,8 @@ async def amain():
                     text = await loop.run_in_executor(
                         None, lambda: record_held(
                             on, max_s=cap,
-                            quiet=lambda: time.monotonic() < quiet_until[0]))
+                            quiet=lambda: time.monotonic() < quiet_until[0],
+                            endpoint=lambda: ep[0]))
                 except Exception as e:
                     # A device-level failure gets plain words instead of a
                     # raw exception. The pre-flight at startup cannot catch
@@ -1847,7 +1851,8 @@ async def amain():
                         conn, abort=lambda: _MIC["gen"] != g,
                         on_audio=session.add)
                     held = time.monotonic() - press_t
-                    phone = getattr(conn, "release_text", None)
+                    # a tap nobody spoke into: dropped, phone words and all
+                    phone = None if conn.tap_dropped else getattr(conn, "release_text", None)
                     if pcm is None or phone:
                         session.cancel()
                     if phone:
@@ -1889,7 +1894,7 @@ async def amain():
                         signals.set_state("idle")
                     # else: a queued tap that came up empty shouldn't
                     # stomp on whatever Jarvis is legitimately doing
-                    if (held >= NOT_A_TAP_S and not (busy or failed)
+                    if (held >= NOT_A_TAP_S and not (busy or failed or conn.tap_dropped)
                             and _MIC["gen"] == g):     # not cut by a mode switch
                         # a real press, not a tap: say so, don't go silent
                         mouth.say("I didn't catch that.",

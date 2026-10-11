@@ -579,6 +579,64 @@ def _log_capture(pcm: np.ndarray, capped: bool):
         log(f"[ears] capped capture not saved: {e}")
 
 
+def _speechy(vad, sp, mono: np.ndarray) -> bool:
+    """One 30 ms frame is speech, by the open mic's rule: Silero sure,
+    or webrtcvad hears something and Silero doesn't rule it out."""
+    heard = vad.is_speech(mono.tobytes(), RATE)
+    if sp is None:
+        return heard
+    p = sp.feed(mono)
+    return p >= SPEECH_P or (heard and p >= SPEECH_P_SOFT)
+
+
+TAP_NO_SPEECH_S = 5.0   # a tap nobody speaks into is dropped quietly
+
+
+class Endpoint:
+    """A tapped press ends itself the way an open-mic utterance does:
+    feed() it 16 kHz audio as it arrives; it answers "end" once speech
+    (OPEN_FRAMES) has been followed by open_mic_silence_ms of quiet, and
+    "none" if no speech starts within TAP_NO_SPEECH_S. A blip under
+    240 ms of speech doesn't count, as in listen_once."""
+
+    def __init__(self, no_speech_s: float = TAP_NO_SPEECH_S):
+        self.vad = webrtcvad.Vad(int(CFG.get("open_mic_vad_level", 2)))
+        self.silence_frames = int(CFG.get("open_mic_silence_ms") or 480) // FRAME_MS
+        try:
+            self.sp = _SpeechProb()
+        except Exception as e:
+            self.sp = None
+            log(f"[ears] Silero unavailable, tap endpointing falls back to webrtcvad: {e!r}")
+        self.limit = int(no_speech_s * 1000) // FRAME_MS
+        self.buf = np.zeros(0, np.int16)
+        self.n = self.run = self.silence = self.speech = 0
+        self.talking = False
+
+    def feed(self, pcm: np.ndarray) -> str | None:
+        self.buf = np.concatenate([self.buf, pcm.astype(np.int16)])
+        while len(self.buf) >= FRAME_LEN:
+            mono, self.buf = self.buf[:FRAME_LEN], self.buf[FRAME_LEN:]
+            self.n += 1
+            s = _speechy(self.vad, self.sp, mono)
+            if not self.talking:
+                self.run = self.run + 1 if s else 0
+                if self.run >= OPEN_FRAMES:
+                    self.talking, self.silence, self.speech = True, 0, 0
+                elif self.n >= self.limit:
+                    return "none"
+                continue
+            if s:
+                self.speech += 1
+                self.silence = 0
+            else:
+                self.silence += 1
+            if self.silence >= self.silence_frames:
+                if self.speech >= 8:
+                    return "end"
+                self.talking, self.run = False, 0   # a blip: keep listening
+        return None
+
+
 class Ears:
     def __init__(self, aggressiveness: int = 2, silence_ms: int = 480):
         self.vad = webrtcvad.Vad(aggressiveness)
@@ -624,12 +682,7 @@ class Ears:
                         # speakers are talking and barge-in isn't on: ignore
                         ring.clear()
                         continue
-                    heard = self.vad.is_speech(mono.tobytes(), RATE)
-                    if sp is not None:
-                        p = sp.feed(mono)
-                        is_speech = p >= SPEECH_P or (heard and p >= SPEECH_P_SOFT)
-                    else:
-                        is_speech = heard
+                    is_speech = _speechy(self.vad, sp, mono)
                     if not in_utterance:
                         ring.append(mono)
                         if len(ring) > 8:
@@ -677,11 +730,14 @@ class Ears:
 
 
 def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25,
-                quiet=None) -> str | None:
+                quiet=None, endpoint=None) -> str | None:
     """Hold-to-talk capture: record raw audio while is_held() is True,
     then transcribe. The button is the VAD — no endpointing. Returns
     None for taps shorter than min_s (accidental presses). While
-    quiet() is True a block goes in as silence (the tap beep)."""
+    quiet() is True a block goes in as silence (the tap beep).
+    endpoint(), once it returns an Endpoint (a tap latched), ends the
+    recording on silence after speech, or drops it (None) if nobody
+    spoke."""
     frames: list[np.ndarray] = []
     session = Session()
     try:
@@ -691,6 +747,15 @@ def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25,
                 if quiet and quiet():
                     block = np.zeros_like(block)
                 frames.append(block[:, 0].copy()); session.add(frames[-1])
+                ep = endpoint and endpoint()
+                end = ep and ep.feed(frames[-1])
+                if end == "none":
+                    log("[ptt] tap with no speech, dropped")
+                    session.cancel()
+                    return None
+                if end == "end":
+                    log("[ptt] tap ended on silence")
+                    break
             # a small tail so the last word isn't clipped at release
             for _ in range(6):
                 block, _ = stream.read(FRAME_LEN)

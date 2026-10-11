@@ -182,6 +182,9 @@ import websockets
 from backtalk.vlog import log
 
 RATE = 16000   # must match ears.RATE — the fixed transcribe() contract
+# A tap's endpoint asks the client to release; past this the server ends
+# it itself (a phone waits up to 3.5 s for its own transcript first).
+ENDPOINT_WAIT_S = 6.0
 CALL_VOICE_RMS = 500   # a caller frame this loud opens the call at the far end
 CALL_RING_S = 20       # the caller has this long to start talking
 
@@ -236,6 +239,8 @@ class Conn:
         self.authed = True    # False: refused unless the first frame is a peer hello
         self.disconnected = False
         self.recording = False   # this tab's own slot, not bridge-wide
+        self.latched = False     # this press is a tap: it ends on silence (latch)
+        self.tap_dropped = False # ...and nobody spoke into it
         self.listening = False   # hands-free: frames outside a press
         self.listen_muted = False   # paused: hearing only "start listening"
         self.call: Call | None = None   # an intercom call: audio relays, untranscribed
@@ -371,6 +376,9 @@ class Conn:
                     self.bridge._on_press(self, interrupt=False)
                 elif kind == "interrupt_press":
                     self.bridge._on_press(self, interrupt=True)
+                elif kind == "latch" and self.recording:
+                    # the press was a tap: end it on silence like hands-free
+                    self.latched = True
                 elif kind == "release":
                     # the phone's own transcript of this press, if it made
                     # one (on-device recognition fed the same audio)
@@ -539,6 +547,7 @@ class BrowserBridge:
             log("[web] press ignored, this tab is already recording")
             return
         conn.recording = True
+        conn.latched = conn.tap_dropped = False
         conn.release_text = None
         conn._released.clear()
         while not conn._frames.empty():
@@ -779,8 +788,15 @@ class BrowserBridge:
         (a streaming transcriber; see ears.Session).
         Resamples any frame whose declared rate isn't already 16000
         (defense against browser/engine quirks) via stdlib audioop —
-        no new dependency. Returns None on no audio at all."""
+        no new dependency. Returns None on no audio at all.
+        A tapped press (latch) is endpointed here: on silence after
+        speech, or no speech at all, the client is told {"type":
+        "endpoint", "speech": b} and sends its release as for a second
+        tap (so a phone's own transcript still rides along); no speech
+        sets conn.tap_dropped and returns None."""
+        from backtalk.ears import Endpoint
         frames: list[np.ndarray] = []
+        ep, told = None, 0.0
         # audioop.ratecv's filter memory, carried across chunks. Passing
         # None on every chunk instead of this would reset the resample
         # filter at each chunk boundary, glitching audio once per chunk
@@ -793,6 +809,9 @@ class BrowserBridge:
                 if abort and abort():
                     return None
                 if conn._released.is_set() and conn._frames.empty():
+                    break
+                if told and time.monotonic() - told > ENDPOINT_WAIT_S:
+                    log("[web] no release after the tap's endpoint, ending it here")
                     break
                 try:
                     chunk = await asyncio.wait_for(conn._frames.get(), timeout=0.2)
@@ -810,9 +829,18 @@ class BrowserBridge:
                 frames.append(np.frombuffer(pcm_bytes, dtype=np.int16))
                 if on_audio is not None:
                     on_audio(frames[-1])
+                if conn.latched and not told:
+                    ep = ep or Endpoint()
+                    end = ep.feed(frames[-1])
+                    if end:
+                        told = time.monotonic()
+                        conn.tap_dropped = end == "none"
+                        log(f"[web] tap {'ended on silence' if end == 'end' else 'with no speech, dropping'}"
+                            f" after {sum(map(len, frames)) / RATE:.1f}s")
+                        self._send(conn, {"type": "endpoint", "speech": end == "end"})
         finally:
             conn.recording = False
-        if not frames:
+        if not frames or conn.tap_dropped:
             return None
         return np.concatenate(frames)
 
