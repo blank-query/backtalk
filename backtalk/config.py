@@ -99,6 +99,14 @@ DEFAULTS = {
     # {"strict-mcp-config": null} so only mcp_servers above load, never the
     # user-scope servers in ~/.claude.json.
     "cli_args": {},
+    # Which agent harness is the brain: "claude" (Claude Code through the
+    # Agent SDK) or "hermes" (Hermes Agent's TUI gateway, brain_hermes.py).
+    # For hermes, "hermes" below names the profile home (HERMES_HOME), the
+    # session's working directory (default agent_dir), and optionally the
+    # gateway command and extra environment. model/deep_model/cli_args/mcp_servers are Claude-only;
+    # a Hermes profile carries its own model, tools, and MCP servers.
+    "brain": "claude",
+    "hermes": {"home": "", "cwd": "", "command": None, "env": {}},
     # Hold-to-talk key. Named keys ("home", "f13", "right_alt", ...)
     # or a single character.
     "ptt_key": "home",

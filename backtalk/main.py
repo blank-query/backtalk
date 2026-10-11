@@ -68,8 +68,11 @@ import time
 import numpy as np
 
 from backtalk import signals, voiceprint
-from backtalk.brain import WarmBrain
+from backtalk.brain import SESSION_FILE, WarmBrain
 from backtalk.config import CFG
+
+if CFG.get("brain") == "hermes":   # Hermes Agent instead of Claude Code (brain_hermes.py)
+    from backtalk.brain_hermes import SESSION_FILE, HermesBrain as WarmBrain
 from backtalk.ears import (Ears, Session, babble, explain_audio_failure,
                            record_held, warm as warm_ears, Endpoint)
 from backtalk.mouth import DIRECTION_HOOKS, Mouth, synth_stream, warm as warm_mouth
@@ -703,7 +706,6 @@ async def amain():
     resume_id = None
     if CFG.get("resume_last_session"):
         try:
-            from backtalk.brain import SESSION_FILE
             with open(SESSION_FILE) as f:
                 resume_id = f.read().strip() or None
         except OSError:
