@@ -389,24 +389,59 @@ class WarmBrain:
         """Send `text` and wait for the FULL text reply, un-spoken —
         for console slash commands and the startup warmup ping, the two
         callers that want an answer back as a return value rather than
-        audio. Bounded: this stream is not trusted to always deliver,
-        and an unbounded await here would deafen the whole voice loop.
-        Only one capture may be in flight at a time (both callers are
-        already serialized by the caller)."""
+        audio. Bounded (capture_timeout_s): this stream is not trusted to
+        always deliver, and an unbounded await here would deafen the
+        whole voice loop. Only one capture may be in flight at a time
+        (both callers are already serialized by the caller).
+
+        A capture is a turn like any other: asks queue behind it,
+        interrupt() reaches it, and the face shows busy while it runs. A
+        capture that times out is interrupted, not walked away from: an
+        orphaned turn kept a slow local model generating for minutes
+        with everything queued behind it (Friday's warmup, 2026-10-10)."""
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
         self._capture = fut
         self._capture_count_turn = count_turn
         self._capture_buf = []
-        await self._client.query(text)
+        self._turn_active = True
+        limit = float(CFG.get("capture_timeout_s") or 90)
         try:
-            return await asyncio.wait_for(fut, 90)
-        except asyncio.TimeoutError:
-            log(f"[brain] capture timed out: {text!r}")
+            await self._client.query(text)
+            deadline = loop.time() + limit
+            while not fut.done() and loop.time() < deadline:
+                # re-asserted, since a reply finishing (the greeting) sets idle
+                if not (self.mouth and self.mouth.speaking):
+                    self.bus.set_state("thinking")
+                await asyncio.wait({fut}, timeout=min(1.0, deadline - loop.time()))
+            if fut.done():
+                return fut.result()
+            log(f"[brain] capture timed out after {limit:.0f}s: {text!r}, interrupting it")
             return "error: the command timed out"
         finally:
             if self._capture is fut:
-                self._capture = None
+                await self._abandon_capture(fut)
+            if not self._turn_active and not (self.mouth and self.mouth.speaking):
+                self.bus.set_state("idle")
+
+    async def _abandon_capture(self, fut):
+        """End a capture turn nobody is waiting on any more. The reader
+        keeps swallowing it (into nothing) through its own ResultMessage,
+        so its leftovers are never spoken and no discard flag is left
+        armed for a turn that might never send one."""
+        fut.cancel()
+        try:
+            await asyncio.wait_for(self._client.interrupt(), 5)
+        except Exception:
+            pass
+        for _ in range(150):
+            if self._capture is not fut:
+                return
+            await asyncio.sleep(0.1)
+        log("[brain] the abandoned capture never ended; releasing the session")
+        self._capture = None
+        self._turn_active = False
+        self._dispatch_next()
 
     async def command(self, cmd: str) -> str:
         """Run a console slash command (/clear, /compact, /model,
@@ -421,7 +456,10 @@ class WarmBrain:
         turn's real content instead."""
         if not self._client or not self._turn_active:
             return
-        self._discard_until_result = True
+        # a capture turn needs no discard: the reader swallows it anyway,
+        # through its ResultMessage
+        if self._capture is None:
+            self._discard_until_result = True
         try:
             await asyncio.wait_for(self._client.interrupt(), 5)
         except Exception:
@@ -627,6 +665,7 @@ class WarmBrain:
                         fut, self._capture = self._capture, None
                         if fut and not fut.done():
                             fut.set_result(" ".join(self._capture_buf).strip())
+                        self._dispatch_next()   # asks queued behind it
                     continue
 
                 if t == "StreamEvent":

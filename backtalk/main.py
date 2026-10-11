@@ -742,8 +742,11 @@ async def amain():
     log("[backtalk] connecting the brain...")
     try:
         await asyncio.wait_for(brain.start(), 120)
-        await asyncio.wait_for(brain.capture(
-            "Warmup ping - reply with the single word: ready"), 180)
+        if CFG.get("warmup_ping", True):
+            # capture() bounds itself; the margin covers its interrupt
+            await asyncio.wait_for(brain.capture(
+                "Warmup ping - reply with the single word: ready"),
+                float(CFG.get("capture_timeout_s") or 90) + 30)
     except (Exception, asyncio.TimeoutError) as e:
         kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
                 else f"failed: {e!r}"[:220])

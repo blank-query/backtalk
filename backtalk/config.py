@@ -156,6 +156,15 @@ DEFAULTS = {
     # default; "low" / "medium" / "high" / "max" applies at launch.
     # Saying "set effort to X" in a voice session saves itself here.
     "effort": "",
+    # The hidden "reply with: ready" ping at launch, which pays the
+    # prompt-cache toll before the first real turn. false skips it: a
+    # local model that is already loaded gains nothing, and on a long
+    # resumed session the ping alone can run for minutes.
+    "warmup_ping": True,
+    # Seconds to wait for a captured reply (the warmup ping and console
+    # commands like /effort, /clear) before interrupting it. A slow local
+    # model wants more.
+    "capture_timeout_s": 90,
     # The voice (Kokoro, local, free). bm_lewis is the proven default —
     # British male, the butler register. Others: bm_george, bm_daniel,
     # bm_fable, am_michael, af_heart... The first letter picks the
