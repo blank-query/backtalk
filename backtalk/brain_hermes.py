@@ -324,6 +324,8 @@ class HermesBrain(WarmBrain):
         await self._client.connect(resume)
         self._start_reader()
         self.clear_tasks()
+        if not (self.mouth and self.mouth.speaking):   # a fresh brain has no turn; the bus may hold a dead one's state
+            self.bus.set_state("idle")
 
     async def _rebuild(self):
         """The gateway died under the reader: start a new one on the same
